@@ -140,12 +140,24 @@ def delete_analysis_results():
 # 설정
 # ══════════════════════════════════════════════════════════
 def get_env_config() -> dict:
+    """설정값 우선순위: st.secrets (Cloud) → 환경변수 → .env 파일 → 코드 기본값"""
+    def _s(key, fallback=""):
+        # 1순위: Streamlit Cloud secrets
+        try:
+            v = st.secrets.get(key)
+            if v: return str(v).strip()
+        except Exception:
+            pass
+        # 2순위: 환경변수 / .env 파일 (dotenv로 이미 로드됨)
+        v = os.getenv(key, "").strip()
+        return v if v else fallback
+
     return {
-        "api_base":   "https://demo.timblo.io/api",
-        "api_key":    "cm8o8cqet000014gd7ig5cxrw",
-        "email":      "sorizava_counsel@timbel.net",
-        "gemini_key": "AIzaSyCKfEZv4w6Jj4abnr6ZwoGJDMPHWre0Y1s".strip(),
-        "openai_key": "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".strip(),
+        "api_base":   _s("TIMBLO_API_BASE",  "https://demo.timblo.io/api"),
+        "api_key":    _s("TIMBLO_API_KEY",    "cm8o8cqet000014gd7ig5cxrw"),
+        "email":      _s("TIMBLO_EMAIL",      "sorizava_counsel@timbel.net"),
+        "gemini_key": _s("GEMINI_API_KEY"),
+        "openai_key": _s("OPENAI_API_KEY"),
     }
 
 def is_timblo_ready(cfg): return bool(cfg["api_base"] and cfg["api_key"] and cfg["email"])
