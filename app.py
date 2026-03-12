@@ -590,16 +590,33 @@ def run_hybrid_analysis(client, content_id, title, start_time, title_meta, cfg) 
 # ══════════════════════════════════════════════════════════
 # 차트 헬퍼
 # ══════════════════════════════════════════════════════════
-def make_radar_chart(cats, vals, color="royalblue", height=320):
+def make_radar_chart(cats, vals, color="royalblue", height=320,
+                     overlay_vals=None, overlay_name="선택 상담자", overlay_color="#e74c3c"):
     fig = go.Figure()
     fig.add_trace(go.Scatterpolar(
         r=vals + [vals[0]], theta=cats + [cats[0]],
         fill="toself", fillcolor="rgba(65,105,225,0.15)",
-        line=dict(color=color, width=2),
+        line=dict(color=color, width=2), name="전체 평균",
+        mode="lines+markers+text",
+        text=[f"{v:.0f}" for v in vals] + [""],
+        textposition="top center",
+        textfont=dict(size=11, color=color),
     ))
+    if overlay_vals:
+        fig.add_trace(go.Scatterpolar(
+            r=overlay_vals + [overlay_vals[0]], theta=cats + [cats[0]],
+            fill="toself", fillcolor="rgba(231,76,60,0.15)",
+            line=dict(color=overlay_color, width=2.5, dash="solid"), name=overlay_name,
+            mode="lines+markers+text",
+            text=[f"{v:.0f}" for v in overlay_vals] + [""],
+            textposition="top center",
+            textfont=dict(size=11, color=overlay_color),
+        ))
     fig.update_layout(
         polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-        showlegend=False, margin=dict(t=30, b=20, l=40, r=40), height=height,
+        showlegend=bool(overlay_vals),
+        legend=dict(orientation="h", y=-0.15),
+        margin=dict(t=30, b=40, l=40, r=40), height=height,
     )
     return fig
 
@@ -845,6 +862,14 @@ with st.sidebar:
                             ["전체","우수(85+)","양호(70+)","보통(60+)","개선필요(60-)"],
                             key="sb_grade")
 
+    # 상담자 선택 — 분석 완료 레코드 기반 (레이더 오버레이 + 전환 예측용)
+    _analyzed_staff = sorted(set(
+        parse_title(r.get("title","")).get("staff","") or "미확인"
+        for r in analyzed.values()
+        if parse_title(r.get("title","")).get("staff","")
+    ))
+    f_counselor = st.selectbox("상담자 선택", ["전체 보기"] + _analyzed_staff, key="sb_counselor")
+
     st.markdown("**기간 필터**")
     # content_list + analyzed 양쪽에서 날짜 풀 수집 (기본값: 전체 기간)
     _cl_dates = [parse_date_str(i.get("meetingStartTime","")) for i in content_list]
@@ -1046,7 +1071,8 @@ with tab_dash:
         col_radar, col_srank = st.columns([2, 3])
 
         with col_radar:
-            st.markdown("**품질 지표 평균**")
+            _radar_label = f"{f_counselor} vs 전체 평균" if f_counselor != "전체 보기" else "품질 지표 평균"
+            st.markdown(f"**{_radar_label}**")
             # 동적 카테고리: 레코드별 rubric_used 또는 quality_scores 키 수집
             seen_cats: dict = {}  # 삽입 순서 보존
             for r in records_filtered:
@@ -1066,7 +1092,27 @@ with tab_dash:
                         qs_agg[k].append(qs[k])
             qs_avg = {k: round(sum(v)/len(v)/5*100, 1) if v else 0 for k, v in qs_agg.items()}
             vals = [qs_avg.get(c, 0) for c in cats]
-            st.plotly_chart(make_radar_chart(cats, vals), use_container_width=True)
+            # 선택 상담자 오버레이
+            _overlay_vals = None
+            if f_counselor != "전체 보기":
+                _counsel_recs = [r for r in records_filtered
+                                 if parse_title(r.get("title","")).get("staff","") == f_counselor]
+                if _counsel_recs:
+                    _c_agg = {k: [] for k in cats}
+                    for r in _counsel_recs:
+                        qs = r.get("quality_scores", {})
+                        for k in cats:
+                            if k in qs: _c_agg[k].append(qs[k])
+                    _overlay_vals = [
+                        round(sum(v)/len(v)/5*100, 1) if v else 0
+                        for v in [_c_agg[k] for k in cats]
+                    ]
+            st.plotly_chart(
+                make_radar_chart(cats, vals,
+                                 overlay_vals=_overlay_vals,
+                                 overlay_name=f_counselor),
+                use_container_width=True,
+            )
 
         with col_srank:
             st.markdown("**직원별 평균 점수 (상위 15명)**")
@@ -1199,29 +1245,73 @@ with tab_dash:
                 "필수 안내": mand_text,
             })
 
-        # width 명시 + use_container_width=False → 표가 화면 밖으로 삐져나가며 가로 스크롤 강제 생성
-        _mand_col_px = max(400, len(_tbl_mand_items) * 160)
-        st.dataframe(
-            pd.DataFrame(rows),
-            use_container_width=False,
-            width=1100 + _mand_col_px,
-            hide_index=True,
-            column_config={
-                "날짜":      st.column_config.TextColumn("날짜",   width="small"),
-                "상담방식":  st.column_config.TextColumn("방식",   width="small"),
-                "지사":      st.column_config.TextColumn("지사",   width="small"),
-                "직원명":    st.column_config.TextColumn("직원명", width="small"),
-                "상담자":    st.column_config.TextColumn("상담자", width="small"),
-                "총점":      st.column_config.ProgressColumn(
-                                 "총점", min_value=0, max_value=100,
-                                 format="%.1f점", width="small"),
-                "등급":      st.column_config.TextColumn("등급",   width="small"),
-                "엔진":      st.column_config.TextColumn("엔진",   width="small"),
-                "흐름":      st.column_config.TextColumn("흐름",   width="small"),
-                "필수 안내": st.column_config.TextColumn(
-                                 "필수 안내 항목별 ✅/❌", width="large"),
-            },
-        )
+        # components.html → overflow-x:auto 보장 (st.dataframe clipping 해결)
+        def _score_color(s):
+            if s >= 85: return "#27ae60"
+            if s >= 70: return "#2980b9"
+            if s >= 60: return "#f39c12"
+            return "#e74c3c"
+
+        _tbl_body = ""
+        for row in rows:
+            sc  = row["총점"]
+            col = _score_color(sc)
+            # 필수 안내 셀: ✅/❌ 뱃지로 변환
+            _mand_html = ""
+            for part in row["필수 안내"].split("  |  "):
+                part = part.strip()
+                if part.startswith("✅"):
+                    _mand_html += (f'<span style="background:#e8f8f0;border:1px solid #27ae60;'
+                                   f'border-radius:10px;padding:2px 7px;margin:2px;'
+                                   f'white-space:nowrap;font-size:12px;">{part}</span>')
+                elif part.startswith("❌"):
+                    _mand_html += (f'<span style="background:#fdf2f2;border:1px solid #e74c3c;'
+                                   f'border-radius:10px;padding:2px 7px;margin:2px;'
+                                   f'white-space:nowrap;font-size:12px;">{part}</span>')
+                elif part.startswith("❓"):
+                    _mand_html += (f'<span style="background:#f9f9f9;border:1px solid #bbb;'
+                                   f'border-radius:10px;padding:2px 7px;margin:2px;'
+                                   f'white-space:nowrap;font-size:12px;">{part}</span>')
+                else:
+                    _mand_html += f'<span style="font-size:12px">{part}</span>'
+
+            _tbl_body += (
+                f'<tr style="border-bottom:1px solid #eee;">'
+                f'<td style="white-space:nowrap;padding:6px 10px;">{row["날짜"]}</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;">{row["상담방식"]}</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;">{row["지사"]}</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;font-weight:600;">{row["직원명"]}</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;">{row["상담자"]}</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;color:{col};font-weight:700;">{sc:.1f}점</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;color:{col};">{row["등급"]}</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;">{row["엔진"]}</td>'
+                f'<td style="white-space:nowrap;padding:6px 10px;">{row["흐름"]}</td>'
+                f'<td style="padding:6px 10px;min-width:380px;">{_mand_html if row["필수 안내"] != "-" else "-"}</td>'
+                f'</tr>'
+            )
+
+        _tbl_html = f"""
+<div style="overflow-x:auto;overflow-y:auto;max-height:480px;
+            border:1px solid #e0e0e0;border-radius:8px;font-family:sans-serif;">
+  <table style="border-collapse:collapse;width:max-content;font-size:13px;">
+    <thead>
+      <tr style="background:#f0f2f6;position:sticky;top:0;z-index:2;">
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">날짜</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">방식</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">지사</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">직원명</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">상담자</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">총점</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">등급</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">엔진</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;white-space:nowrap;">흐름</th>
+        <th style="padding:8px 12px;border-bottom:2px solid #ccc;min-width:380px;">필수 안내 항목별 ✅/❌</th>
+      </tr>
+    </thead>
+    <tbody>{_tbl_body}</tbody>
+  </table>
+</div>"""
+        components.html(_tbl_html, height=min(520, 60 + 40 * len(rows)), scrolling=False)
 
         # ── 지사/직원별 상담방식 통계 피벗 표 ──
         st.markdown("---")
@@ -1285,36 +1375,217 @@ with tab_dash:
             st.dataframe(mand_df[["항목","준수율(%)","준수","미준수","분석건수"]],
                          use_container_width=True, hide_index=True)
 
-        # ── 업로드 현황 요약 테이블 (content_list 기반) ──
-        if content_list:
-            st.markdown("---")
-            st.subheader("업로드 현황 요약")
-            up_rows = []
-            for item in content_list:
-                t = item.get("title", "")
-                p = parse_title(t)
-                up_rows.append({
+        # ── 성공 패턴 & Golden Phrases (항상 표시) ──
+        st.markdown("---")
+        st.subheader("💡 AI 전략 인사이트")
+        _excellent_recs = [r for r in records_filtered if r.get("total_score", 0) >= 85]
+
+        if not _excellent_recs:
+            st.info("우수 상담(85점 이상) 데이터가 아직 없습니다. 분석을 더 진행하면 성공 패턴이 자동으로 추출됩니다.")
+        else:
+            st.caption(f"우수 상담(85점 이상) {len(_excellent_recs)}건에서 추출한 핵심 패턴")
+
+            # 성공 키워드: 상담사 키워드 빈도 집계
+            _succ_kw: dict = {}
+            for r in _excellent_recs:
+                for kw in r.get("counselor_keywords", []):
+                    _succ_kw[kw] = _succ_kw.get(kw, 0) + 1
+            _top_kw = sorted(_succ_kw.items(), key=lambda x: x[1], reverse=True)[:12]
+
+            # Golden Phrases: strengths에서 수집
+            _phrases: list = []
+            for r in _excellent_recs:
+                for s in r.get("strengths", []):
+                    if s and s not in _phrases:
+                        _phrases.append(s)
+                if len(_phrases) >= 9:
+                    break
+
+            col_kw_s, col_phrases = st.columns([1, 2])
+            with col_kw_s:
+                st.markdown("**🏅 핵심 성공 키워드**")
+                if _top_kw:
+                    _kw_tags = " ".join(
+                        f'<span style="background:#e8f4fd;border:1px solid #3498db;'
+                        f'border-radius:14px;padding:4px 10px;margin:3px;'
+                        f'display:inline-block;font-size:13px;color:#1a5276;">'
+                        f'{"🔥" if cnt >= 3 else "✦"} {kw} <b>({cnt})</b></span>'
+                        for kw, cnt in _top_kw
+                    )
+                    st.markdown(_kw_tags, unsafe_allow_html=True)
+                else:
+                    st.info("키워드 데이터가 부족합니다.")
+
+            with col_phrases:
+                st.markdown("**💬 Golden Phrases — 설득 핵심 문장**")
+                if _phrases:
+                    for i, phrase in enumerate(_phrases[:6]):
+                        _bg = "#fff9e6" if i % 2 == 0 else "#f0fff4"
+                        st.markdown(
+                            f'<div style="background:{_bg};border-left:4px solid #f39c12;'
+                            f'border-radius:6px;padding:8px 14px;margin:5px 0;'
+                            f'font-size:13.5px;line-height:1.5;">'
+                            f'💬 {phrase}</div>',
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.info("우수 상담의 강점 데이터가 아직 부족합니다.")
+
+        # ── 상담방식별 Top 5 랭킹 ──
+        st.markdown("---")
+        st.subheader("🏆 상담방식별 Top 5 랭킹")
+        _ch_cols = st.columns(3)
+        _channel_list = [("방문", _ch_cols[0]), ("비대면", _ch_cols[1]), ("전화", _ch_cols[2])]
+        for _ch_key, _ch_col in _channel_list:
+            _ch_recs = [r for r in records_filtered
+                        if _ch_key in (parse_title(r.get("title","")).get("mode","") or "")]
+            with _ch_col:
+                st.markdown(f"**{_ch_key} 상담 Top 5**")
+                if _ch_recs:
+                    _ch_staff: dict = {}
+                    for r in _ch_recs:
+                        s = parse_title(r.get("title","")).get("staff","") or "미확인"
+                        _ch_staff.setdefault(s, []).append(r["total_score"])
+                    _ch_df = pd.DataFrame([
+                        {"직원명": s, "건수": len(v), "평균점수": round(sum(v)/len(v), 1)}
+                        for s, v in _ch_staff.items()
+                    ]).sort_values("평균점수", ascending=False).head(5).reset_index(drop=True)
+                    _ch_df.index = _ch_df.index + 1  # 1-based rank
+                    st.dataframe(
+                        _ch_df,
+                        use_container_width=True,
+                        hide_index=False,
+                        column_config={
+                            "직원명":  st.column_config.TextColumn("직원명"),
+                            "건수":    st.column_config.NumberColumn("건수", format="%d건"),
+                            "평균점수": st.column_config.ProgressColumn(
+                                "평균점수", min_value=0, max_value=100, format="%.1f점"),
+                        },
+                    )
+                else:
+                    st.caption("해당 방식 데이터 없음")
+
+        # ── 전환 가능성 예측 ──
+        st.markdown("---")
+        st.subheader("🎯 전환 가능성 예측")
+
+        def _calc_conversion(r) -> int:
+            base   = r.get("total_score", 0)
+            flow   = r.get("flow_stages", {})
+            f_done = sum(1 for v in flow.values() if v)
+            f_tot  = len(flow) or 6
+            pos    = r.get("sentiment", {}).get("positive", 0.33)
+            risk   = len(r.get("risk_signals", []))
+            score  = base * 0.80 + (f_done / f_tot) * 12 + pos * 8 - risk * 2
+            return int(min(100, max(0, round(score))))
+
+        _staff_conv: dict = {}
+        for r in records_filtered:
+            s = parse_title(r.get("title","")).get("staff","") or "미확인"
+            _staff_conv.setdefault(s, []).append(_calc_conversion(r))
+
+        _conv_df = pd.DataFrame([
+            {"직원명": s, "전환가능성": round(sum(v)/len(v), 1), "건수": len(v)}
+            for s, v in _staff_conv.items()
+        ]).sort_values("전환가능성", ascending=False)
+
+        _avg_conv = round(_conv_df["전환가능성"].mean(), 1) if not _conv_df.empty else 0
+
+        if f_counselor != "전체 보기":
+            # 선택 상담자 metric
+            _sel_rows = _conv_df[_conv_df["직원명"] == f_counselor]
+            if not _sel_rows.empty:
+                _sel_conv = _sel_rows.iloc[0]["전환가능성"]
+                _delta = round(_sel_conv - _avg_conv, 1)
+                col_m1, col_m2, col_m3 = st.columns([1, 1, 3])
+                with col_m1:
+                    st.metric(f"{f_counselor}", f"{_sel_conv}점",
+                              delta=f"{_delta:+.1f} vs 평균")
+                with col_m2:
+                    st.metric("전체 평균", f"{_avg_conv}점")
+            else:
+                st.caption(f"{f_counselor}의 전환 가능성 데이터가 없습니다")
+        else:
+            col_m1, col_m2 = st.columns(2)
+            col_m1.metric("전체 평균 전환가능성", f"{_avg_conv}점")
+            _top_conv = _conv_df.iloc[0] if not _conv_df.empty else None
+            if _top_conv is not None:
+                col_m2.metric(f"최고 ({_top_conv['직원명']})", f"{_top_conv['전환가능성']}점")
+
+        # 막대 차트 + 평균선
+        if not _conv_df.empty:
+            _conv_plot = _conv_df.sort_values("전환가능성", ascending=True).tail(20)
+            _highlight = f_counselor if f_counselor != "전체 보기" else None
+            _colors = [
+                "#e74c3c" if _highlight and row["직원명"] == _highlight else "#3498db"
+                for _, row in _conv_plot.iterrows()
+            ]
+            fig_conv = go.Figure(go.Bar(
+                x=_conv_plot["전환가능성"],
+                y=_conv_plot["직원명"],
+                orientation="h",
+                marker_color=_colors,
+                text=[f"{v}점" for v in _conv_plot["전환가능성"]],
+                textposition="outside",
+            ))
+            fig_conv.add_vline(
+                x=_avg_conv, line_dash="dash", line_color="orange", line_width=2,
+                annotation_text=f"평균 {_avg_conv}점",
+                annotation_position="top right",
+            )
+            fig_conv.update_layout(
+                xaxis=dict(range=[0, 105], title="전환가능성 점수"),
+                margin=dict(t=20, b=20),
+                height=max(280, 32 * len(_conv_plot)),
+            )
+            st.plotly_chart(fig_conv, use_container_width=True)
+
+        # ── 업로드 현황 요약 (분석 결과 테이블과 동일 데이터 기반) ──
+        st.markdown("---")
+        st.subheader("업로드 현황 요약")
+        st.caption("※ 아래 '분석 결과 테이블'과 동일한 기준으로 집계됩니다")
+        if records_filtered:
+            _up_rows = []
+            for r in records_filtered:
+                p = parse_title(r.get("title", ""))
+                _up_rows.append({
                     "상담방식": p.get("mode") or "미분류",
                     "지사":     p.get("branch") or "미확인",
                     "직원명":   p.get("staff") or "미확인",
-                    "날짜":     parse_date_str(item.get("meetingStartTime", "")),
-                    "분석여부": "✅" if item.get("contentId") in analyzed else "⬜",
                 })
-            up_df = pd.DataFrame(up_rows)
-            # 요약: 방식별 건수
+            _up_df = pd.DataFrame(_up_rows)
+
             col_sum1, col_sum2, col_sum3 = st.columns(3)
             with col_sum1:
                 st.markdown("**상담방식별**")
-                mode_sum = up_df.groupby("상담방식").size().reset_index(name="건수").sort_values("건수", ascending=False)
-                st.dataframe(mode_sum, hide_index=True, use_container_width=True)
+                _mode_sum = (
+                    _up_df.groupby("상담방식").size()
+                    .reset_index(name="건수")
+                    .sort_values("건수", ascending=False)
+                )
+                st.dataframe(_mode_sum, hide_index=True, use_container_width=True,
+                             column_config={"건수": st.column_config.NumberColumn("건수", format="%d건")})
             with col_sum2:
                 st.markdown("**지사별**")
-                branch_sum = up_df.groupby("지사").size().reset_index(name="건수").sort_values("건수", ascending=False)
-                st.dataframe(branch_sum, hide_index=True, use_container_width=True)
+                _branch_sum = (
+                    _up_df.groupby("지사").size()
+                    .reset_index(name="건수")
+                    .sort_values("건수", ascending=False)
+                )
+                st.dataframe(_branch_sum, hide_index=True, use_container_width=True,
+                             column_config={"건수": st.column_config.NumberColumn("건수", format="%d건")})
             with col_sum3:
                 st.markdown("**직원별 (상위 10명)**")
-                staff_sum = up_df.groupby("직원명").size().reset_index(name="건수").sort_values("건수", ascending=False).head(10)
-                st.dataframe(staff_sum, hide_index=True, use_container_width=True)
+                _staff_sum = (
+                    _up_df.groupby("직원명").size()
+                    .reset_index(name="건수")
+                    .sort_values("건수", ascending=False)
+                    .head(10)
+                )
+                st.dataframe(_staff_sum, hide_index=True, use_container_width=True,
+                             column_config={"건수": st.column_config.NumberColumn("건수", format="%d건")})
+        else:
+            st.info("분석 데이터가 없습니다.")
 
 
 # ══════════════════════════════════════════════════════════
