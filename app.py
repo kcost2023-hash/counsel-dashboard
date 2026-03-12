@@ -225,16 +225,25 @@ def calc_total_score(quality_scores: dict, rubric: list = None) -> float:
 
 
 def score_grade(score: float) -> str:
-    if score >= 85: return "우수"
-    if score >= 70: return "양호"
-    if score >= 60: return "보통"
-    return "개선필요"
+    if score >= 95: return "S"
+    if score >= 85: return "A"
+    if score >= 70: return "B"
+    if score >= 55: return "C"
+    return "D"
+
+
+def score_grade_label(score: float) -> str:
+    """등급 + 한글 설명"""
+    g = score_grade(score)
+    labels = {"S": "S (최상)", "A": "A (우수)", "B": "B (양호)", "C": "C (보통)", "D": "D (개선필요)"}
+    return labels.get(g, g)
 
 
 def score_color(score: float) -> str:
+    if score >= 95: return "#6a0dad"
     if score >= 85: return "#2e7d32"
     if score >= 70: return "#1565c0"
-    if score >= 60: return "#f57c00"
+    if score >= 55: return "#f57c00"
     return "#c62828"
 
 
@@ -365,8 +374,9 @@ def get_rubric_for_mode(mode: str, user_cfg: dict) -> list:
 # ══════════════════════════════════════════════════════════
 # 심층 분석 프롬프트
 # ══════════════════════════════════════════════════════════
-def build_deep_prompt(conversation_text: str, speech_stats: dict, title_meta: dict,
-                      user_cfg: dict = None) -> str:
+def build_analysis_prompts(conversation_text: str, speech_stats: dict, title_meta: dict,
+                           user_cfg: dict = None) -> tuple:
+    """채점 시스템 프롬프트(system_text)와 대화 분석 프롬프트(user_text)를 반환."""
     if user_cfg is None:
         user_cfg = DEFAULT_USER_CONFIG
 
@@ -459,39 +469,39 @@ def build_deep_prompt(conversation_text: str, speech_stats: dict, title_meta: di
         mand_instruction = ""
         mand_json = ',\n  "mandatory_check": {}'
 
-    # 시스템 프롬프트 (페르소나)
+    # 페르소나
     persona_line = system_prompt if system_prompt else "당신은 직업훈련 상담 품질 평가 전문가입니다."
 
-    # 채널별 채점표 최상단 요약 블록 (AI가 채점 기준을 놓치지 않도록 상단 배치)
-    rubric_summary_lines = [
-        f'   ▶ {r["항목"]} (배점 {r["배점"]}점): {(r.get("기준","") or "해당 역량 평가")[:60]}...'
-        if len(r.get("기준","")) > 60 else
-        f'   ▶ {r["항목"]} (배점 {r["배점"]}점): {r.get("기준","해당 역량 평가")}'
+    # 채널별 채점표 (system role에 배치)
+    rubric_lines = [
+        f'  - {r["항목"]} [배점 {r["배점"]}점]: {r.get("기준","") or "해당 역량 평가"}'
         for r in rubric
     ]
-    rubric_summary = "\n".join(rubric_summary_lines)
+    rubric_block = "\n".join(rubric_lines)
     total_max = sum(r["배점"] for r in rubric)
 
-    return f"""{persona_line}
-아래 상담 대화를 분석하여 반드시 지정된 JSON 형식으로만 응답하세요.
-JSON 외의 텍스트, 설명, 마크다운 코드블록을 절대 포함하지 마세요.
+    # ── SYSTEM TEXT (채점 규칙 + 루브릭 고정 — 토큰 절약) ──
+    system_text = f"""{persona_line}
+반드시 JSON 형식으로만 응답하세요. JSON 외 텍스트·마크다운 절대 금지.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【채점표 최우선 기준 — 반드시 이 기준으로만 채점】
-총 배점: {total_max}점 기준 / 각 항목 1~5점 (배점×점수/5 = 항목 득점)
-{rubric_summary}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## 채점표 (총 배점 {total_max}점 / 각 항목 1~5점)
+{rubric_block}
 
-★★★ 채점 핵심 원칙 (반드시 적용) ★★★
-① 관대한 채점: 상담사가 해당 항목의 핵심 내용을 조금이라도 언급했다면 최소 3점 이상 부여.
-   완벽하지 않아도 노력이 보이면 4점. 탁월하게 수행했다면 5점.
-② 키워드 보너스: 웍스파이, 수정시간 10분, 가격 인상, 무이자, 타임머신, 약어기능 등
-   핵심 키워드가 명시적으로 언급된 경우 해당 항목 최소 4점 보장.
-③ STT 오타 허용: 음성인식 오류로 발생한 유사 발음/구어체를 정상 언급으로 인정.
-④ 짧은 상담도 핵심만 있으면 고점 가능: 발화량이 적어도 핵심 내용을 전달했다면 높은 점수.
-⑤ 점수 분포: 60점 이하 집중을 피하고, 현실적인 역량을 반영하여 70~90점대로 분산.
+## 채점 원칙 (엄격·객관 기준)
+- 5점: 세부 기준 완전 충족 + 구체적 언급·실행 확인
+- 4점: 대부분 충족, 일부 세부 요소 누락
+- 3점: 핵심만 언급, 구체성·깊이 부족
+- 2점: 형식적·피상적 언급에 그침
+- 1점: 해당 항목 미수행 또는 완전 누락
+- 점수 편중 금지: 3점(중간값)에만 집중하지 말고 1~5 전 구간 활용
+- STT 오타 허용: 유사 발음·구어체를 정상 언급으로 인정
+- 키워드 가점: 웍스파이/워크스, 가격 인상/팀벨 인상, 2026년/수정 시간 10분 등
+  핵심 키워드 명시 언급 → 해당 항목 최소 4점 보장
+- 짧아도 핵심 전달 시 고점 가능
+{mand_instruction}"""
 
-[상담 메타정보]
+    # ── USER TEXT (대화 내용 + 분석 지시) ──
+    user_text = f"""[상담 메타정보]
 {meta_block}
 
 [화자별 발화 통계]
@@ -500,41 +510,70 @@ JSON 외의 텍스트, 설명, 마크다운 코드블록을 절대 포함하지 
 [전체 대화 내용]
 {conversation_text}
 
-[분석 지시 — 아래 항목을 모두 분석하여 하나의 JSON으로 반환]
-
-1. 역할 판별: 발화 내용 성격(설명/질문/고민)을 기반으로 상담원/고객을 판별하세요.
-
-2. 품질 점수 (각 항목 1~5점, 위 채점 원칙 必 적용):
+[분석 지시 — 아래 항목 전부 분석 → 단일 JSON 반환]
+1. 역할 판별: 발화 성격(설명/질문/고민)으로 상담원/고객 구분
+2. 품질 점수 (각 항목 1~5점, system 채점 원칙 必 적용):
 {q_block}
+3. 흐름 단계 포함 여부 (true/false): {flow_list}
+4. 강점 3가지 (실제 대화 근거 기반 한 문장씩)
+5. 개선점 3가지 (경청 문제 포함)
+6. 고객 발화 TOP 20 키워드, 상담사 발화 TOP 20 키워드 (의미있는 명사/동사)
+7. 질문 패턴 횟수: 공부기간, 시험난이도, 수익가능성, 가격, 취업가능성, 기타
+8. 감정 분석: 긍정/중립/부정 비율 (합계 1.0)
+9. 위험 신호 문구 목록 (고민, 비쌈, 시간없음 등)
+10. 코칭 멘트 3~5문장
 
-3. 흐름 분석: 아래 단계 포함 여부 (true/false)
-   {flow_list}
-
-4. 강점 3가지 (각 명확한 한 문장 — 실제 대화 근거 기반)
-5. 개선점 3가지 (각 명확한 한 문장, 경청 문제 포함)
-6. 키워드: 고객 발화 TOP 20 단어, 상담사 발화 TOP 20 단어 (의미있는 명사/동사)
-7. 질문 패턴: 고객이 언급한 각 주제별 횟수 (없으면 0)
-   공부기간, 시험난이도, 수익가능성, 가격, 취업가능성, 기타
-8. 감정 분석: 고객 발화 기준 긍정/중립/부정 비율 (합계 반드시 1.0)
-9. 위험 신호: "고민해보겠습니다, 비싸네요, 알아보고 올게요, 시간이 없어요" 등 탐지 문구 목록
-10. 코칭 멘트: 종합적인 개선 방향 피드백 (3~5문장){mand_instruction}
-
-반드시 아래 JSON 구조로만 반환하세요:
+반드시 아래 JSON 구조로만 반환:
 {{
   "identified_counselor": "참석자 N",
   "identified_customer": "참석자 N",
-  "role_reason": "역할 판별 근거 1~2문장",
+  "role_reason": "근거 1~2문장",
   "quality_scores": {{{q_schema}}},
   "flow_stages": {{{flow_schema}}},
-  "strengths": ["강점1", "강점2", "강점3"],
-  "improvements": ["개선점1", "개선점2", "개선점3"],
-  "customer_keywords": ["키워드1", "키워드2"],
-  "counselor_keywords": ["키워드1", "키워드2"],
-  "question_patterns": {{"공부기간": 0, "시험난이도": 0, "수익가능성": 0, "가격": 0, "취업가능성": 0, "기타": 0}},
-  "sentiment": {{"positive": 0.3, "neutral": 0.5, "negative": 0.2}},
+  "strengths": ["강점1","강점2","강점3"],
+  "improvements": ["개선점1","개선점2","개선점3"],
+  "customer_keywords": ["키워드1","키워드2"],
+  "counselor_keywords": ["키워드1","키워드2"],
+  "question_patterns": {{"공부기간":0,"시험난이도":0,"수익가능성":0,"가격":0,"취업가능성":0,"기타":0}},
+  "sentiment": {{"positive":0.3,"neutral":0.5,"negative":0.2}},
   "risk_signals": [],
-  "coaching": "코칭 멘트 전문"{mand_json}
+  "coaching": "코칭 멘트"{mand_json}
 }}"""
+
+    return system_text, user_text
+
+
+def build_deep_prompt(conversation_text: str, speech_stats: dict, title_meta: dict,
+                      user_cfg: dict = None) -> str:
+    """하위 호환용 래퍼 — system+user를 합쳐 단일 문자열로 반환."""
+    sys_t, usr_t = build_analysis_prompts(conversation_text, speech_stats, title_meta, user_cfg)
+    return sys_t + "\n\n" + usr_t
+
+
+# ══════════════════════════════════════════════════════════
+# 텍스트 전처리
+# ══════════════════════════════════════════════════════════
+_MIN_CONV_CHARS = 100   # 이 미만이면 AI 호출 생략
+
+
+def preprocess_conv_text(raw: str) -> str:
+    """STT 노이즈 제거 + 핵심 발화만 남겨 토큰 절약."""
+    lines = raw.split("\n")
+    cleaned = []
+    for line in lines:
+        s = line.strip()
+        # 3글자 미만 단독 발화(네/아/음 등) 제거
+        if len(s) < 3:
+            continue
+        # 연속 동일 문구 제거
+        if cleaned and s == cleaned[-1]:
+            continue
+        cleaned.append(s)
+    text = "\n".join(cleaned)
+    # 과도한 개행/공백 정리
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
 
 
 # ══════════════════════════════════════════════════════════
@@ -549,12 +588,20 @@ def fetch_transcript(client, content_id: str, title_meta: dict) -> dict:
         raise ValueError(f"[EMPTY_DATA] {content_id} — 텍스트 없음")
     if not conv["lines"]:
         raise ValueError(f"[EMPTY_DATA] {content_id} — 발화 0건")
+    clean_text = preprocess_conv_text(conv["text"])
+    if len(clean_text) < _MIN_CONV_CHARS:
+        raise ValueError(f"[EMPTY_DATA] {content_id} — 텍스트 너무 짧음 ({len(clean_text)}자)")
     speech_stats = compute_speech_stats(detail, use_merged=True)
-    prompt = build_deep_prompt(conv["text"], speech_stats, title_meta,
-                               user_cfg=st.session_state.get("user_config"))
+    sys_txt, usr_txt = build_analysis_prompts(clean_text, speech_stats, title_meta,
+                                              user_cfg=st.session_state.get("user_config"))
     cached = {
-        "text": conv["text"], "lines": conv["lines"],
-        "speech_stats": speech_stats, "analysis_prompt": prompt,
+        "text": conv["text"],          # 하드매칭용 원본
+        "clean_text": clean_text,       # 전처리된 텍스트 (AI 전달용)
+        "lines": conv["lines"],
+        "speech_stats": speech_stats,
+        "system_prompt_text": sys_txt,  # system role
+        "user_prompt_text": usr_txt,    # user role
+        "analysis_prompt": sys_txt + "\n\n" + usr_txt,  # 구형 호환
         "segment_count": len(conv["lines"]),
     }
     st.session_state.transcripts[content_id] = cached
@@ -632,11 +679,12 @@ def run_gemini_analysis(client, content_id, title, start_time, title_meta, gemin
     cached = fetch_transcript(client, content_id, title_meta)
     genai.configure(api_key=gemini_api_key)
     try:
-        model    = genai.GenerativeModel(
+        model = genai.GenerativeModel(
             "gemini-2.0-flash",
             generation_config={"response_mime_type": "application/json"},
+            system_instruction=cached["system_prompt_text"],   # ← system role 분리
         )
-        response = model.generate_content(cached["analysis_prompt"])
+        response = model.generate_content(cached["user_prompt_text"])
         raw_text = response.text.strip()
     except Exception as e:
         raise RuntimeError(f"[{classify_error(e)}] Gemini 호출 실패: {e}") from e
@@ -646,42 +694,48 @@ def run_gemini_analysis(client, content_id, title, start_time, title_meta, gemin
         raise RuntimeError(f"[JSON_PARSE] Gemini JSON 파싱 실패: {e}") from e
     _ucfg  = st.session_state.get("user_config") or DEFAULT_USER_CONFIG
     rubric = get_rubric_for_mode(title_meta.get("mode", ""), _ucfg)
-    # 하드매칭: 대화 텍스트 스캔으로 AI 누락 키워드 강제 PASS
     result = hard_match_mandatory(cached["text"], _ucfg.get("mandatory_items", []), result)
     return build_record(content_id, title, start_time, result,
                         cached["speech_stats"], cached["segment_count"], "Gemini", rubric=rubric)
 
 
-def run_openai_analysis(client, content_id, title, start_time, title_meta, openai_api_key) -> dict:
+def run_openai_analysis(client, content_id, title, start_time, title_meta,
+                        openai_api_key, model_id: str = "gpt-4o-mini") -> dict:
     from openai import OpenAI as _OpenAI
     cached = fetch_transcript(client, content_id, title_meta)
     oa = _OpenAI(api_key=openai_api_key)
     try:
         resp = oa.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": cached["analysis_prompt"]}],
-            temperature=0.2,
+            model=model_id,
+            messages=[
+                {"role": "system", "content": cached["system_prompt_text"]},  # ← system role
+                {"role": "user",   "content": cached["user_prompt_text"]},
+            ],
+            temperature=0.15,
             response_format={"type": "json_object"},
         )
         raw_text = resp.choices[0].message.content.strip()
     except Exception as e:
-        raise RuntimeError(f"[{classify_error(e)}] OpenAI 호출 실패: {e}") from e
+        raise RuntimeError(f"[{classify_error(e)}] OpenAI({model_id}) 호출 실패: {e}") from e
     try:
         result = parse_ai_json(raw_text)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"[JSON_PARSE] OpenAI JSON 파싱 실패: {e}") from e
     _ucfg  = st.session_state.get("user_config") or DEFAULT_USER_CONFIG
     rubric = get_rubric_for_mode(title_meta.get("mode", ""), _ucfg)
-    # 하드매칭: 대화 텍스트 스캔으로 AI 누락 키워드 강제 PASS
     result = hard_match_mandatory(cached["text"], _ucfg.get("mandatory_items", []), result)
+    engine_label = "ChatGPT-4o" if "gpt-4o" in model_id and "mini" not in model_id else "ChatGPT"
     return build_record(content_id, title, start_time, result,
-                        cached["speech_stats"], cached["segment_count"], "ChatGPT", rubric=rubric)
+                        cached["speech_stats"], cached["segment_count"], engine_label, rubric=rubric)
 
 
 def run_hybrid_analysis(client, content_id, title, start_time, title_meta, cfg) -> dict:
     gemini_key = cfg.get("gemini_key")
     openai_key = cfg.get("openai_key")
-    if gemini_key:
+    # 선택된 AI 모델 (고성능 모드 지원)
+    sel_model  = st.session_state.get("ai_model", "gpt-4o-mini")
+
+    if gemini_key and sel_model == "gemini":
         try:
             return run_gemini_analysis(client, content_id, title, start_time, title_meta, gemini_key)
         except RuntimeError as e:
@@ -693,7 +747,10 @@ def run_hybrid_analysis(client, content_id, title, start_time, title_meta, cfg) 
             else:
                 raise
     if openai_key:
-        return run_openai_analysis(client, content_id, title, start_time, title_meta, openai_key)
+        return run_openai_analysis(client, content_id, title, start_time, title_meta,
+                                   openai_key, model_id=sel_model if sel_model != "gemini" else "gpt-4o-mini")
+    if gemini_key:
+        return run_gemini_analysis(client, content_id, title, start_time, title_meta, gemini_key)
     raise RuntimeError("Gemini와 OpenAI 키가 모두 없습니다.")
 
 
@@ -838,6 +895,7 @@ _defaults = {
     "user_config": None,        # 사용자 커스텀 설정 (None이면 파일에서 로드)
     "results_loaded": False,    # 파일에서 분석 결과 로드 여부
     "reanalyze_target": None,   # 목록에서 재분석 요청된 content_id
+    "ai_model": "gpt-4o-mini",  # 사용 AI 모델 (gpt-4o-mini / gpt-4o / gemini)
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -969,7 +1027,7 @@ with st.sidebar:
     f_branch = st.selectbox("지사",     ["전체"] + all_branches, key="sb_branch")
     f_staff  = st.selectbox("직원명",   ["전체"] + all_staff,   key="sb_staff")
     f_grade  = st.selectbox("품질등급",
-                            ["전체","우수(85+)","양호(70+)","보통(60+)","개선필요(60-)"],
+                            ["전체","S(95+)","A(85+)","B(70+)","C(55+)","D(55-)"],
                             key="sb_grade")
 
     # 상담자 선택 — 분석 완료 레코드 기반 (레이더 오버레이 + 전환 예측용)
@@ -1060,6 +1118,28 @@ with st.sidebar:
                 st.session_state.auto_failed = []; st.rerun()
 
     st.markdown("---")
+    st.markdown("**AI 모델 설정**")
+    _model_opts = {
+        "gpt-4o-mini": "⚡ GPT-4o mini (빠름·절약)",
+        "gpt-4o":      "🚀 GPT-4o (고성능)",
+        "gemini":      "✨ Gemini 2.0 Flash",
+    }
+    _cur_model = st.session_state.get("ai_model", "gpt-4o-mini")
+    _sel = st.selectbox(
+        "분석 모델",
+        list(_model_opts.keys()),
+        format_func=lambda k: _model_opts[k],
+        index=list(_model_opts.keys()).index(_cur_model) if _cur_model in _model_opts else 0,
+        key="sb_ai_model",
+        label_visibility="collapsed",
+    )
+    if _sel != _cur_model:
+        st.session_state.ai_model = _sel
+        st.rerun()
+    if _sel == "gpt-4o":
+        st.caption("⚠️ 고성능 모드 — 토큰 비용 약 10배")
+
+    st.markdown("---")
     if st.button("로그아웃", use_container_width=True):
         st.session_state.authenticated = False; st.rerun()
 
@@ -1072,10 +1152,11 @@ def apply_filters(records: list) -> list:
     if f_mode   != "전체": out = [r for r in out if parse_title(r.get("title","")).get("mode","")   == f_mode]
     if f_branch != "전체": out = [r for r in out if parse_title(r.get("title","")).get("branch","") == f_branch]
     if f_staff  != "전체": out = [r for r in out if parse_title(r.get("title","")).get("staff","")  == f_staff]
-    if f_grade == "우수(85+)":       out = [r for r in out if r.get("total_score", 0) >= 85]
-    elif f_grade == "양호(70+)":     out = [r for r in out if 70 <= r.get("total_score", 0) < 85]
-    elif f_grade == "보통(60+)":     out = [r for r in out if 60 <= r.get("total_score", 0) < 70]
-    elif f_grade == "개선필요(60-)": out = [r for r in out if r.get("total_score", 0) < 60]
+    if f_grade == "S(95+)":   out = [r for r in out if r.get("total_score", 0) >= 95]
+    elif f_grade == "A(85+)": out = [r for r in out if 85 <= r.get("total_score", 0) < 95]
+    elif f_grade == "B(70+)": out = [r for r in out if 70 <= r.get("total_score", 0) < 85]
+    elif f_grade == "C(55+)": out = [r for r in out if 55 <= r.get("total_score", 0) < 70]
+    elif f_grade == "D(55-)": out = [r for r in out if r.get("total_score", 0) < 55]
     if date_range and isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         s_d, e_d = date_range
         out = [r for r in out if r.get("date") and
@@ -1125,16 +1206,25 @@ with tab_dash:
         # ── KPI ──
         scores    = [r["total_score"] for r in records_filtered]
         avg_score = round(sum(scores) / len(scores), 1)
-        excellent = sum(1 for s in scores if s >= 85)
-        needs_rev = sum(1 for s in scores if s < 60)
-        flow_ok   = sum(1 for r in records_filtered if sum(r.get("flow_stages",{}).values()) >= 4)
+        cnt_S = sum(1 for s in scores if s >= 95)
+        cnt_A = sum(1 for s in scores if 85 <= s < 95)
+        cnt_B = sum(1 for s in scores if 70 <= s < 85)
+        cnt_C = sum(1 for s in scores if 55 <= s < 70)
+        cnt_D = sum(1 for s in scores if s < 55)
+        flow_ok = sum(1 for r in records_filtered if sum(r.get("flow_stages",{}).values()) >= 4)
+        n = len(records_filtered)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("분석 완료",      f"{len(records_filtered)}건")
-        c2.metric("평균 점수",      f"{avg_score}점")
-        c3.metric("우수 (85+)",     f"{excellent}건", f"{excellent/len(records_filtered)*100:.0f}%")
-        c4.metric("개선필요 (60-)", f"{needs_rev}건",  f"{needs_rev/len(records_filtered)*100:.0f}%")
-        c5.metric("흐름 완성 (4+)", f"{flow_ok}건")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("분석 완료",   f"{n}건")
+        c2.metric("평균 점수",   f"{avg_score}점",
+                  delta=score_grade(avg_score))
+        c3.metric("S+A (우수)",  f"{cnt_S+cnt_A}건",
+                  f"{(cnt_S+cnt_A)/n*100:.0f}%")
+        c4.metric("B (양호)",    f"{cnt_B}건",
+                  f"{cnt_B/n*100:.0f}%")
+        c5.metric("C+D (개선)",  f"{cnt_C+cnt_D}건",
+                  f"-{(cnt_C+cnt_D)/n*100:.0f}%" if cnt_C+cnt_D else "0%")
+        c6.metric("흐름 완성",   f"{flow_ok}건")
 
         st.markdown("---")
 
