@@ -239,6 +239,73 @@ def score_color(score: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════
+# 필수 안내 항목 하드 매칭 키워드 (대화 텍스트에서 발견 시 강제 PASS)
+# 항목명에 아래 key 문자열이 포함되면 해당 keyword 목록으로 매핑
+# ══════════════════════════════════════════════════════════
+MANDATORY_KEYWORD_MAP: dict = {
+    # 웍스파이(Worksfy) 실제 수요 인증
+    "웍스파이": [
+        "웍스파이", "워크스파이", "워크스", "웍스", "Worksfy", "worksfy",
+        "일감 플랫폼", "일감플랫폼", "일거리 사이트", "일거리사이트",
+        "플랫폼", "프리랜서 플랫폼", "협회 플랫폼",
+    ],
+    # 가격 인상 예정 고지
+    "가격 인상": [
+        "가격 인상", "가격인상", "금액 변동", "금액변동",
+        "장비값 오른", "팀벨 인상", "팀벨인상", "인상 예정", "인상예정",
+        "오를 예정", "오르기 전", "가격이 오", "비용 인상", "비용인상",
+        "가격 올", "금액 올",
+    ],
+    # 구매 적기 어필
+    "구매 적기": [
+        "지금이 적기", "2026년", "수정 시간 10분", "수정시간 10분",
+        "난이도 하향", "취득 적기", "적기", "지금이 최적기",
+        "지금 시작", "이번 달", "한시적", "지금이 기회",
+        "기회", "지금 아니면",
+    ],
+}
+
+
+def hard_match_mandatory(conv_text: str, mandatory_items: list, ai_result: dict) -> dict:
+    """대화 원문에서 키워드를 직접 스캔하여 AI 누락 보정.
+    키워드가 발견되면 해당 항목을 강제로 done=True 처리.
+    이미 True인 항목은 그대로 유지.
+    """
+    mc = dict(ai_result.get("mandatory_check") or {})
+    text_lower = conv_text.lower()
+
+    for item in mandatory_items:
+        # 이미 done=True 이면 건드리지 않음
+        existing = mc.get(item)
+        if isinstance(existing, dict) and _coerce_done(existing.get("done", False)):
+            continue
+        if isinstance(existing, bool) and existing:
+            continue
+
+        # 이 항목에 매핑할 키워드 목록 결정
+        kw_list: list = []
+        for key_pattern, kws in MANDATORY_KEYWORD_MAP.items():
+            if key_pattern in item:
+                kw_list = kws
+                break
+
+        if not kw_list:
+            continue
+
+        # 키워드 스캔
+        found_kw = next((kw for kw in kw_list if kw.lower() in text_lower), None)
+        if found_kw:
+            mc[item] = {
+                "done": True,
+                "evidence": f"[하드매칭] 대화 텍스트에서 키워드 '{found_kw}' 직접 발견",
+                "미준수_사유": "",
+            }
+
+    ai_result["mandatory_check"] = mc
+    return ai_result
+
+
+# ══════════════════════════════════════════════════════════
 # 필수 안내 체크 정제 헬퍼
 # ══════════════════════════════════════════════════════════
 def _coerce_done(raw) -> bool:
@@ -337,7 +404,7 @@ def build_deep_prompt(conversation_text: str, speech_stats: dict, title_meta: di
     flow_list   = ", ".join(u_flow_stages)
     flow_schema = ", ".join(f'"{s}": false' for s in u_flow_stages)
 
-    # 필수 안내 항목
+    # 필수 안내 항목 + 하드매칭 키워드 힌트 블록
     if mandatory_items:
         mand_lines = [f"   - {item}" for item in mandatory_items]
         mand_block = "\n".join(mand_lines)
@@ -345,33 +412,47 @@ def build_deep_prompt(conversation_text: str, speech_stats: dict, title_meta: di
             f'"{item}": {{"done": false, "evidence": "판단근거 또는 관련 발화 인용", "미준수_사유": ""}}'
             for item in mandatory_items
         )
+
+        # 항목별 동의어 힌트 자동 생성
+        kw_hint_lines = []
+        for item in mandatory_items:
+            for key_pat, kw_list in MANDATORY_KEYWORD_MAP.items():
+                if key_pat in item:
+                    kw_hint_lines.append(
+                        f'   · "{item}" → 아래 중 하나라도 발견되면 즉시 done:true\n'
+                        f'     인식 키워드: {", ".join(kw_list[:8])}'
+                    )
+                    break
+        kw_hint_block = "\n".join(kw_hint_lines) if kw_hint_lines else ""
+
         mand_instruction = f"""
-11. 필수 안내 항목 점검 ★★★ 가장 중요한 지시 — 반드시 정독 후 판단하세요 ★★★
+11. 필수 안내 항목 점검 ★★★★★ 최우선 지시 — 전체 프롬프트에서 가장 중요 ★★★★★
 
 점검 대상 항목:
 {mand_block}
 
-━━━ 핵심 판단 원칙 (위반 금지) ━━━
+━━━ 항목별 인식 키워드 (하드매칭 목록) ━━━
+{kw_hint_block}
 
-① 항목명과 100% 일치하는 단어를 찾으려 하지 마십시오.
-   상담원이 해당 주제에 대해 문맥상 충분히 설명했거나 관련 키워드를 언급했다면,
-   긍정적으로 해석하여 반드시 done: true로 평가하십시오.
+━━━ 핵심 판단 원칙 (절대 위반 금지) ━━━
 
-② 아래 상황이면 무조건 done: true 입니다:
-   - 항목의 핵심 개념(예: 수요, 인증, 가격, 혜택 등)이 상담 중 한 번이라도 등장
-   - STT 오타·유사 발음·구어체로 표현된 경우 (예: 웍스파이=웍스=워크스)
-   - 상담원이 해당 주제로 설명을 진행한 사실이 문맥으로 확인되는 경우
-   - 고객이 해당 주제를 물어보고 상담원이 응답한 경우
+① 위 키워드 목록 중 하나라도 대화 텍스트에 등장하면 → 해당 항목 즉시 done: true
+   (STT 오타/유사발음/구어체 포함: 웍스파이≈웍스≈워크스파이≈워크스≈Worksfy)
 
-③ done: false는 오직 아래 경우만 허용합니다:
-   - 전체 대화에서 해당 주제가 단 한 번도 언급·암시되지 않았을 때
+② 아래 상황도 모두 done: true:
+   - 항목의 핵심 개념이 대화 중 한 번이라도 언급·암시
+   - 상담원이 해당 주제로 설명·언급한 사실이 문맥으로 확인
+   - 고객이 해당 주제로 질문하고 상담원이 답변
 
-④ 판단이 조금이라도 불확실하면 → done: true (관대한 기준 적용)
+③ done: false는 오직 아래 경우만:
+   - 전체 대화에서 해당 주제·키워드·개념이 단 한 번도 등장하지 않았을 때
+
+④ 판단이 1%라도 불확실하면 → done: true (관대한 기준 적용)
 
 ━━━ JSON 출력 규칙 ━━━
 · done 필드: 반드시 boolean (true 또는 false) 만 허용. "True", "O", "준수" 등 문자열 절대 금지.
-· evidence 필드: done 판단 근거 또는 실제 발화 내용 인용 (true이든 false이든 반드시 기재).
-· 미준수_사유 필드: done이 false일 때만 왜 false인지 구체적 사유 기재. true이면 빈 문자열("").
+· evidence 필드: 실제 대화에서 발견한 발화 내용 직접 인용 (true/false 모두 필수 기재).
+· 미준수_사유 필드: done이 false일 때만 구체적 사유 기재. true이면 반드시 빈 문자열("").
 """
         mand_json = f',\n  "mandatory_check": {{{mand_schema_pairs}}}'
     else:
@@ -381,9 +462,34 @@ def build_deep_prompt(conversation_text: str, speech_stats: dict, title_meta: di
     # 시스템 프롬프트 (페르소나)
     persona_line = system_prompt if system_prompt else "당신은 직업훈련 상담 품질 평가 전문가입니다."
 
+    # 채널별 채점표 최상단 요약 블록 (AI가 채점 기준을 놓치지 않도록 상단 배치)
+    rubric_summary_lines = [
+        f'   ▶ {r["항목"]} (배점 {r["배점"]}점): {(r.get("기준","") or "해당 역량 평가")[:60]}...'
+        if len(r.get("기준","")) > 60 else
+        f'   ▶ {r["항목"]} (배점 {r["배점"]}점): {r.get("기준","해당 역량 평가")}'
+        for r in rubric
+    ]
+    rubric_summary = "\n".join(rubric_summary_lines)
+    total_max = sum(r["배점"] for r in rubric)
+
     return f"""{persona_line}
 아래 상담 대화를 분석하여 반드시 지정된 JSON 형식으로만 응답하세요.
 JSON 외의 텍스트, 설명, 마크다운 코드블록을 절대 포함하지 마세요.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【채점표 최우선 기준 — 반드시 이 기준으로만 채점】
+총 배점: {total_max}점 기준 / 각 항목 1~5점 (배점×점수/5 = 항목 득점)
+{rubric_summary}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+★★★ 채점 핵심 원칙 (반드시 적용) ★★★
+① 관대한 채점: 상담사가 해당 항목의 핵심 내용을 조금이라도 언급했다면 최소 3점 이상 부여.
+   완벽하지 않아도 노력이 보이면 4점. 탁월하게 수행했다면 5점.
+② 키워드 보너스: 웍스파이, 수정시간 10분, 가격 인상, 무이자, 타임머신, 약어기능 등
+   핵심 키워드가 명시적으로 언급된 경우 해당 항목 최소 4점 보장.
+③ STT 오타 허용: 음성인식 오류로 발생한 유사 발음/구어체를 정상 언급으로 인정.
+④ 짧은 상담도 핵심만 있으면 고점 가능: 발화량이 적어도 핵심 내용을 전달했다면 높은 점수.
+⑤ 점수 분포: 60점 이하 집중을 피하고, 현실적인 역량을 반영하여 70~90점대로 분산.
 
 [상담 메타정보]
 {meta_block}
@@ -398,13 +504,13 @@ JSON 외의 텍스트, 설명, 마크다운 코드블록을 절대 포함하지 
 
 1. 역할 판별: 발화 내용 성격(설명/질문/고민)을 기반으로 상담원/고객을 판별하세요.
 
-2. 품질 점수 (각 항목 1~5점):
+2. 품질 점수 (각 항목 1~5점, 위 채점 원칙 必 적용):
 {q_block}
 
 3. 흐름 분석: 아래 단계 포함 여부 (true/false)
    {flow_list}
 
-4. 강점 3가지 (각 명확한 한 문장)
+4. 강점 3가지 (각 명확한 한 문장 — 실제 대화 근거 기반)
 5. 개선점 3가지 (각 명확한 한 문장, 경청 문제 포함)
 6. 키워드: 고객 발화 TOP 20 단어, 상담사 발화 TOP 20 단어 (의미있는 명사/동사)
 7. 질문 패턴: 고객이 언급한 각 주제별 횟수 (없으면 0)
@@ -538,8 +644,10 @@ def run_gemini_analysis(client, content_id, title, start_time, title_meta, gemin
         result = parse_ai_json(raw_text)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"[JSON_PARSE] Gemini JSON 파싱 실패: {e}") from e
-    rubric = get_rubric_for_mode(title_meta.get("mode", ""),
-                                  st.session_state.get("user_config") or DEFAULT_USER_CONFIG)
+    _ucfg  = st.session_state.get("user_config") or DEFAULT_USER_CONFIG
+    rubric = get_rubric_for_mode(title_meta.get("mode", ""), _ucfg)
+    # 하드매칭: 대화 텍스트 스캔으로 AI 누락 키워드 강제 PASS
+    result = hard_match_mandatory(cached["text"], _ucfg.get("mandatory_items", []), result)
     return build_record(content_id, title, start_time, result,
                         cached["speech_stats"], cached["segment_count"], "Gemini", rubric=rubric)
 
@@ -562,8 +670,10 @@ def run_openai_analysis(client, content_id, title, start_time, title_meta, opena
         result = parse_ai_json(raw_text)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"[JSON_PARSE] OpenAI JSON 파싱 실패: {e}") from e
-    rubric = get_rubric_for_mode(title_meta.get("mode", ""),
-                                  st.session_state.get("user_config") or DEFAULT_USER_CONFIG)
+    _ucfg  = st.session_state.get("user_config") or DEFAULT_USER_CONFIG
+    rubric = get_rubric_for_mode(title_meta.get("mode", ""), _ucfg)
+    # 하드매칭: 대화 텍스트 스캔으로 AI 누락 키워드 강제 PASS
+    result = hard_match_mandatory(cached["text"], _ucfg.get("mandatory_items", []), result)
     return build_record(content_id, title, start_time, result,
                         cached["speech_stats"], cached["segment_count"], "ChatGPT", rubric=rubric)
 
