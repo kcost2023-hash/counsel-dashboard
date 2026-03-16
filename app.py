@@ -162,55 +162,72 @@ _CRM_COL_PURCH_DT = 35   # AJ열: 구입 날짜
 # 결제 성공으로 판단할 구입여부 키워드
 _PURCHASE_POSITIVE = ["결제완료", "예약", "계약", "등록완료", "등록"]
 
+# ── CRM 구글 시트 기본 URL (공개 공유 링크 — secrets.toml 없이도 동작) ──
+# 시트가 "링크 있는 모든 사용자 - 뷰어" 이상 공개 상태여야 합니다.
+_CRM_SHEET_ID  = "1N-8DO73uT9tzTQgUYL9EOCdirVW6CrNA6NRJGOR8Wus"
+_CRM_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{_CRM_SHEET_ID}"
+
 
 @st.cache_data(ttl=600)
-def load_crm_data() -> pd.DataFrame:
+def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
     """
     구글 시트 지사별 탭에서 CRM 데이터를 모두 불러와 하나의 DataFrame으로 병합합니다.
-    @st.cache_data(ttl=600) 으로 10분간 결과를 캐시합니다.
+    @st.cache_data(ttl=600) — 10분 캐시.
 
-    ──────────────────────────────────────────────────────────
-    [로컬 환경 .streamlit/secrets.toml 설정 방법]
+    ── 인증 방식 (자동 선택) ──────────────────────────────────────────
+    방법 A (우선): .streamlit/secrets.toml 에 서비스 계정 설정 시 → st.connection 사용
+    방법 B (기본): 설정 없음 → 공개 시트 CSV 내보내기 URL로 직접 읽기
+                  (시트가 "링크 있는 모든 사용자" 공개 설정이어야 함)
 
-    1) Google Cloud Console (https://console.cloud.google.com) 에서:
-       - 프로젝트 생성 → "Google Sheets API" 및 "Google Drive API" 활성화
-       - IAM > 서비스 계정 생성 → 키(JSON 형식) 다운로드
-
-    2) 대상 구글 시트를 열고:
-       - 공유 > 서비스 계정 이메일(client_email)에 "편집자" 권한 부여
-
-    3) .streamlit/secrets.toml 파일에 아래 블록 추가:
-
+    ── secrets.toml 서비스 계정 설정 예시 ────────────────────────────
     [connections.gsheets]
-    spreadsheet = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=0"
+    spreadsheet = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit"
     type = "gsheets"
 
     [connections.gsheets.credentials]
     type = "service_account"
     project_id = "your-gcp-project-id"
-    private_key_id = "abc123def456..."
-    private_key = "-----BEGIN PRIVATE KEY-----\\nMIIEv...YOUR_KEY...\\n-----END PRIVATE KEY-----\\n"
+    private_key_id = "abc123..."
+    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
     client_email = "your-sa@your-project.iam.gserviceaccount.com"
-    client_id = "123456789012345678"
+    client_id = "123456789"
     auth_uri = "https://accounts.google.com/o/oauth2/auth"
     token_uri = "https://oauth2.googleapis.com/token"
     auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-    client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/your-sa%40your-project.iam.gserviceaccount.com"
+    client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
     universe_domain = "googleapis.com"
-
-    ※ private_key 값 내의 실제 줄바꿈(\\n)은 두 글자 '\\' + 'n' 으로 입력하세요.
-    ※ Streamlit Cloud 배포 시: 앱 Settings > Secrets 메뉴에 동일 내용 붙여넣기
-    ──────────────────────────────────────────────────────────
+    ※ private_key 내 실제 줄바꿈은 두 글자 \\n 으로 입력하세요.
+    ── Streamlit Cloud 배포 시: 앱 Settings > Secrets 에 동일 내용 ──
     """
-    if not _GSHEETS_OK:
-        return pd.DataFrame()
-
-    conn = st.connection("gsheets", type=_GSheetsConnection)
     frames: list[pd.DataFrame] = []
+
+    # secrets.toml 에 connections.gsheets 설정 여부 확인
+    _has_secrets = False
+    if _GSHEETS_OK:
+        try:
+            _has_secrets = bool(st.secrets.get("connections", {}).get("gsheets"))
+        except Exception:
+            pass
 
     for branch in _CRM_BRANCHES:
         try:
-            df_raw = conn.read(worksheet=branch, ttl=600)
+            if _has_secrets:
+                # ── 방법 A: 서비스 계정 인증 (비공개 시트 가능) ──
+                conn = st.connection("gsheets", type=_GSheetsConnection)
+                df_raw = conn.read(
+                    spreadsheet=f"https://docs.google.com/spreadsheets/d/{sheet_id}",
+                    worksheet=branch,
+                    ttl=600,
+                )
+            else:
+                # ── 방법 B: 공개 시트 CSV 내보내기 (credentials 불필요) ──
+                import urllib.parse
+                csv_url = (
+                    f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+                    f"/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(branch)}"
+                )
+                df_raw = pd.read_csv(csv_url, header=0)
+
             if df_raw is None or df_raw.empty:
                 continue
 
@@ -1084,8 +1101,16 @@ for k, v in _defaults.items():
 if st.session_state.user_config is None:
     st.session_state.user_config = load_user_config()
 
-# 분석 결과 로드 (세션 최초 1회 — 파일에서 영구 데이터 복원)
-if not st.session_state.results_loaded:
+# 분석 결과 로드
+# - 최초 1회 로드 (results_loaded == False)
+# - analyzed가 비어있는데 파일은 있으면 항상 재시도 (results_loaded 여부 무관)
+# - 강제 새로고침 버튼(force_reload_results) 클릭 시 재로드
+_should_load = (
+    not st.session_state.results_loaded
+    or st.session_state.get("force_reload_results")
+    or (not st.session_state.analyzed and not st.session_state.get("_load_tried_empty"))
+)
+if _should_load:
     _file_results = load_analysis_results()
     if _file_results:
         for _k, _v in _file_results.items():
@@ -1094,7 +1119,11 @@ if not st.session_state.results_loaded:
                 if isinstance(_v, dict) and "mandatory_check" in _v:
                     _v["mandatory_check"] = parse_mandatory_check(_v["mandatory_check"])
                 st.session_state.analyzed[_k] = _v
+    else:
+        # 파일이 없거나 비어있음 — 루프 방지용 플래그
+        st.session_state["_load_tried_empty"] = True
     st.session_state.results_loaded = True
+    st.session_state["force_reload_results"] = False
 
 
 # ══════════════════════════════════════════════════════════
@@ -1245,6 +1274,14 @@ with st.sidebar:
     n_todo = len([i for i in content_list if i.get("contentId") not in analyzed])
     n_fail = len(st.session_state.auto_failed)
     st.caption(f"완료 {n_done}건  |  미분석 {n_todo}건  |  오류 {n_fail}건")
+
+    # 저장된 분석 결과가 보이지 않을 때 강제 새로고침
+    if n_done == 0 and os.path.exists(_RESULTS_FILE):
+        if st.button("📂 저장 결과 불러오기", use_container_width=True, type="primary"):
+            st.session_state["force_reload_results"] = True
+            st.session_state.results_loaded = False
+            st.rerun()
+        st.caption(f"💡 `analysis_results.json` 파일이 감지됨")
 
     g_cnt = sum(1 for r in analyzed.values() if r.get("engine") == "Gemini")
     c_cnt = sum(1 for r in analyzed.values() if r.get("engine") == "ChatGPT")
