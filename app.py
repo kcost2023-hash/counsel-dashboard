@@ -34,6 +34,13 @@ from timblo_api import (
     build_conversation_text, compute_speech_stats,
 )
 
+# ── 구글 시트 연동 (선택적 — streamlit-gsheets-connection 미설치 시 해당 기능 비활성화) ──
+try:
+    from streamlit_gsheets import GSheetsConnection as _GSheetsConnection
+    _GSHEETS_OK = True
+except ImportError:
+    _GSHEETS_OK = False
+
 # ══════════════════════════════════════════════════════════
 # 상수
 # ══════════════════════════════════════════════════════════
@@ -134,6 +141,178 @@ def delete_analysis_results():
             os.remove(_RESULTS_FILE)
     except Exception:
         pass
+
+
+# ══════════════════════════════════════════════════════════
+# CRM 구글 시트 연동 유틸리티
+# ══════════════════════════════════════════════════════════
+
+# 지사 탭 목록 (구글 시트에서 읽을 워크시트 이름)
+_CRM_BRANCHES = ["강남", "가산", "대전", "대구", "광주", "부산"]
+
+# 구글 시트 컬럼 위치 (0-based 인덱스; 헤더 행 제외)
+# A=0, B=1, ... H=7, ... X=23, Y=24, ... AI=34, AJ=35
+_CRM_COL_CUSTOMER = 1    # B열: 가입자명(고객명)
+_CRM_COL_DATE     = 7    # H열: 상담 날짜
+_CRM_COL_STAFF    = 23   # X열: 상담 직원
+_CRM_COL_MODE     = 24   # Y열: 상담 방식
+_CRM_COL_PURCHASE = 34   # AI열: 구입 여부 (결제완료 / 예약 / 미결제 등)
+_CRM_COL_PURCH_DT = 35   # AJ열: 구입 날짜
+
+# 결제 성공으로 판단할 구입여부 키워드
+_PURCHASE_POSITIVE = ["결제완료", "예약", "계약", "등록완료", "등록"]
+
+
+@st.cache_data(ttl=600)
+def load_crm_data() -> pd.DataFrame:
+    """
+    구글 시트 지사별 탭에서 CRM 데이터를 모두 불러와 하나의 DataFrame으로 병합합니다.
+    @st.cache_data(ttl=600) 으로 10분간 결과를 캐시합니다.
+
+    ──────────────────────────────────────────────────────────
+    [로컬 환경 .streamlit/secrets.toml 설정 방법]
+
+    1) Google Cloud Console (https://console.cloud.google.com) 에서:
+       - 프로젝트 생성 → "Google Sheets API" 및 "Google Drive API" 활성화
+       - IAM > 서비스 계정 생성 → 키(JSON 형식) 다운로드
+
+    2) 대상 구글 시트를 열고:
+       - 공유 > 서비스 계정 이메일(client_email)에 "편집자" 권한 부여
+
+    3) .streamlit/secrets.toml 파일에 아래 블록 추가:
+
+    [connections.gsheets]
+    spreadsheet = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=0"
+    type = "gsheets"
+
+    [connections.gsheets.credentials]
+    type = "service_account"
+    project_id = "your-gcp-project-id"
+    private_key_id = "abc123def456..."
+    private_key = "-----BEGIN PRIVATE KEY-----\\nMIIEv...YOUR_KEY...\\n-----END PRIVATE KEY-----\\n"
+    client_email = "your-sa@your-project.iam.gserviceaccount.com"
+    client_id = "123456789012345678"
+    auth_uri = "https://accounts.google.com/o/oauth2/auth"
+    token_uri = "https://oauth2.googleapis.com/token"
+    auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+    client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/your-sa%40your-project.iam.gserviceaccount.com"
+    universe_domain = "googleapis.com"
+
+    ※ private_key 값 내의 실제 줄바꿈(\\n)은 두 글자 '\\' + 'n' 으로 입력하세요.
+    ※ Streamlit Cloud 배포 시: 앱 Settings > Secrets 메뉴에 동일 내용 붙여넣기
+    ──────────────────────────────────────────────────────────
+    """
+    if not _GSHEETS_OK:
+        return pd.DataFrame()
+
+    conn = st.connection("gsheets", type=_GSheetsConnection)
+    frames: list[pd.DataFrame] = []
+
+    for branch in _CRM_BRANCHES:
+        try:
+            df_raw = conn.read(worksheet=branch, ttl=600)
+            if df_raw is None or df_raw.empty:
+                continue
+
+            n_cols = df_raw.shape[1]
+            col_map = {
+                "가입자명":     _CRM_COL_CUSTOMER,
+                "상담날짜":     _CRM_COL_DATE,
+                "상담직원":     _CRM_COL_STAFF,
+                "상담방식_crm": _CRM_COL_MODE,
+                "구입여부":     _CRM_COL_PURCHASE,
+                "구입날짜":     _CRM_COL_PURCH_DT,
+            }
+            # 시트 열 수가 부족한 경우 존재하는 열만 추출
+            valid = {k: v for k, v in col_map.items() if v < n_cols}
+            if "가입자명" not in valid:
+                continue
+
+            sub = df_raw.iloc[:, list(valid.values())].copy()
+            sub.columns = list(valid.keys())
+            sub["지사_crm"] = branch
+            frames.append(sub)
+        except Exception:
+            pass    # 개별 시트 실패 시 나머지 계속 진행
+
+    if not frames:
+        return pd.DataFrame()
+
+    crm = pd.concat(frames, ignore_index=True)
+
+    # 가입자명 정제 및 빈 행 제거
+    crm["가입자명"] = crm["가입자명"].astype(str).str.strip()
+    crm = crm[~crm["가입자명"].isin(["", "nan", "None"])]
+
+    # 매핑 키: 이름 내 모든 공백 제거 후 비교
+    crm["가입자명_key"] = crm["가입자명"].str.replace(r"\s+", "", regex=True)
+    if "상담직원" in crm.columns:
+        crm["상담직원_key"] = crm["상담직원"].astype(str).str.replace(r"\s+", "", regex=True)
+    else:
+        crm["상담직원_key"] = ""
+
+    # 날짜 정규화
+    if "상담날짜" in crm.columns:
+        crm["상담날짜_dt"]  = pd.to_datetime(crm["상담날짜"], errors="coerce")
+        crm["상담날짜_str"] = crm["상담날짜_dt"].dt.strftime("%Y-%m-%d").fillna("")
+    else:
+        crm["상담날짜_dt"]  = pd.NaT
+        crm["상담날짜_str"] = ""
+
+    return crm
+
+
+def merge_timblo_crm(records: list, crm_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    팀블로 분석 레코드(list of dict)와 CRM 구글 시트 데이터를 Left Join으로 병합합니다.
+
+    매칭 기준:
+        상담자명(팀블로 제목) ↔ 가입자명(CRM)  &  직원명(팀블로) ↔ 상담직원(CRM)
+        이름 내 공백 전부 제거 후 비교 (예: "남 은도" == "남은도")
+
+    날짜 덮어쓰기 규칙:
+        매칭 성공 → 대시보드 표기 날짜를 CRM 시트의 '상담날짜'로 교체
+        매칭 실패 → 팀블로 원본 날짜 유지
+    """
+    if crm_df.empty or not records:
+        return pd.DataFrame(records)
+
+    rows = []
+    for r in records:
+        p          = parse_title(r.get("title", ""))
+        client_key = re.sub(r"\s+", "", p.get("client", "") or "")
+        staff_key  = re.sub(r"\s+", "", p.get("staff",  "") or "")
+        row        = dict(r)
+
+        # 매칭 시도: 고객명 + 직원명 동시 일치 우선, 고객명만도 허용
+        matched = pd.DataFrame()
+        if client_key and staff_key:
+            matched = crm_df[
+                (crm_df["가입자명_key"] == client_key) &
+                (crm_df["상담직원_key"] == staff_key)
+            ]
+        if matched.empty and client_key:
+            matched = crm_df[crm_df["가입자명_key"] == client_key]
+
+        if not matched.empty:
+            m = matched.iloc[0]
+            # 날짜 덮어쓰기: CRM 상담날짜 우선
+            crm_date = m.get("상담날짜_str", "")
+            if crm_date:
+                row["date"] = crm_date
+            row["crm_구입여부"] = str(m.get("구입여부", "")).strip()
+            row["crm_구입날짜"] = str(m.get("구입날짜", "")).strip()
+            row["crm_지사"]     = str(m.get("지사_crm", "")).strip()
+            row["crm_matched"]  = True
+        else:
+            row["crm_구입여부"] = ""
+            row["crm_구입날짜"] = ""
+            row["crm_지사"]     = ""
+            row["crm_matched"]  = False
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1786,6 +1965,197 @@ with tab_dash:
                              column_config={"건수": st.column_config.NumberColumn("건수", format="%d건")})
         else:
             st.info("분석 데이터가 없습니다.")
+
+        # ══════════════════════════════════════════════════════
+        # CRM 구글 시트 연동 섹션 (secrets.toml 설정 시 활성화)
+        # ══════════════════════════════════════════════════════
+        _crm_df = pd.DataFrame()
+        _crm_load_error = ""
+        if _GSHEETS_OK:
+            try:
+                _crm_df = load_crm_data()
+            except Exception as _e:
+                _crm_load_error = str(_e)
+
+        if not _GSHEETS_OK:
+            pass  # 라이브러리 미설치 → 조용히 무시
+        elif _crm_load_error:
+            st.markdown("---")
+            st.info(f"📋 CRM 구글 시트 미연결 — .streamlit/secrets.toml 설정 후 활성화됩니다. ({_crm_load_error[:80]})")
+        elif not _crm_df.empty:
+            st.markdown("---")
+            st.subheader("📋 CRM 연동 교차 분석")
+
+            # ── ① 지사/직원별 업무 누락 체크 표 ─────────────────────────
+            st.markdown("#### ⚠️ 지사/직원별 업무 누락 체크")
+            st.caption("CRM 실제 상담 건수 vs 팀블로 업로드 건수 비교 | 누락 5건 이상 직원은 빨간 배경으로 표시됩니다.")
+
+            # CRM 기준: 지사 + 직원별 건수
+            _crm_grp = (
+                _crm_df.groupby(["지사_crm", "상담직원_key"])
+                .size()
+                .reset_index(name="실제상담건수_crm")
+                .rename(columns={"지사_crm": "지사", "상담직원_key": "직원명_key"})
+            )
+
+            # 팀블로 기준: content_list_all (전체 업로드, 분석 여부 무관)
+            _timblo_src = st.session_state.get("content_list_all") or content_list or []
+            _timblo_rows = []
+            for _item in _timblo_src:
+                _p = parse_title(_item.get("editedTitle") or _item.get("title", ""))
+                _br  = _p.get("branch", "") or "미확인"
+                _stf = re.sub(r"\s+", "", _p.get("staff", "") or "")
+                if _stf:
+                    _timblo_rows.append({"지사": _br, "직원명_key": _stf})
+
+            if _timblo_rows:
+                _timblo_cnt = (
+                    pd.DataFrame(_timblo_rows)
+                    .groupby(["지사", "직원명_key"])
+                    .size()
+                    .reset_index(name="업로드건수_timblo")
+                )
+            else:
+                _timblo_cnt = pd.DataFrame(columns=["지사", "직원명_key", "업로드건수_timblo"])
+
+            # Left Join: CRM 기준으로 팀블로 건수 병합
+            _nurak_df = _crm_grp.merge(_timblo_cnt, on=["지사", "직원명_key"], how="left")
+            _nurak_df["업로드건수_timblo"] = _nurak_df["업로드건수_timblo"].fillna(0).astype(int)
+            _nurak_df["누락건수"] = (
+                _nurak_df["실제상담건수_crm"] - _nurak_df["업로드건수_timblo"]
+            ).clip(lower=0)
+
+            # 직원명 표시용 원본 이름 복원 (공백 제거 키 → 원본)
+            _staff_name_map = {}
+            if "상담직원" in _crm_df.columns:
+                _staff_name_map = (
+                    _crm_df.drop_duplicates("상담직원_key")
+                    .set_index("상담직원_key")["상담직원"]
+                    .to_dict()
+                )
+            _nurak_df["직원명"] = (
+                _nurak_df["직원명_key"].map(_staff_name_map).fillna(_nurak_df["직원명_key"])
+            )
+            _nurak_df = _nurak_df[["지사", "직원명", "실제상담건수_crm", "업로드건수_timblo", "누락건수"]]
+            _nurak_df = _nurak_df.sort_values(
+                ["누락건수", "실제상담건수_crm"], ascending=[False, False]
+            )
+
+            # 누락 5건 이상 행 배경색 강조 (1~4건은 단순 시간차로 간주하여 제외)
+            def _style_nurak(row):
+                if row["누락건수"] >= 5:
+                    return ["background-color: #fce8e8"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                _nurak_df.style.apply(_style_nurak, axis=1),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "지사":              st.column_config.TextColumn("지사"),
+                    "직원명":            st.column_config.TextColumn("직원명"),
+                    "실제상담건수_crm":  st.column_config.NumberColumn("실제 상담 건수 (CRM)", format="%d건"),
+                    "업로드건수_timblo": st.column_config.NumberColumn("업로드 건수 (팀블로)", format="%d건"),
+                    "누락건수":          st.column_config.NumberColumn("누락 건수", format="%d건"),
+                },
+            )
+            _alert_cnt = int((_nurak_df["누락건수"] >= 5).sum())
+            if _alert_cnt:
+                st.warning(f"⚠️ 누락 5건 이상 직원: **{_alert_cnt}명** — 즉시 확인이 필요합니다.")
+
+            # ── ② AI 품질 점수 × 실제 결제 전환율 상관관계 차트 ──────────
+            st.markdown("---")
+            st.markdown("#### 📈 AI 품질 점수 × 실제 결제 전환율 상관관계")
+            st.caption('"AI 점수가 높을수록 실제 결제율이 높은가?" — CRM 매칭 데이터 기준')
+
+            _merged_df = merge_timblo_crm(records_filtered, _crm_df)
+            _matched_df = (
+                _merged_df[_merged_df["crm_matched"] == True].copy()
+                if "crm_matched" in _merged_df.columns
+                else pd.DataFrame()
+            )
+
+            if _matched_df.empty:
+                st.info(
+                    "CRM 매칭 데이터가 없습니다. "
+                    "팀블로 제목의 상담자명·직원명이 CRM 시트와 동일하게 입력되어 있는지 확인하세요."
+                )
+            else:
+                # 결제 성공 여부 판별
+                def _is_purchased(val: str) -> bool:
+                    v = str(val).strip()
+                    return any(kw in v for kw in _PURCHASE_POSITIVE)
+
+                _matched_df["결제성공"] = _matched_df["crm_구입여부"].apply(_is_purchased)
+
+                # AI 점수 4구간 분류
+                def _score_band(score: float) -> str:
+                    if score >= 90: return "90점 이상"
+                    if score >= 80: return "80점대"
+                    if score >= 70: return "70점대"
+                    return "60점 이하"
+
+                _matched_df["점수구간"] = _matched_df["total_score"].apply(_score_band)
+
+                _band_order = ["60점 이하", "70점대", "80점대", "90점 이상"]
+                _band_stats = (
+                    _matched_df.groupby("점수구간")
+                    .agg(전체건수=("결제성공", "count"), 결제건수=("결제성공", "sum"))
+                    .reindex(_band_order)
+                    .fillna(0)
+                    .reset_index()
+                )
+                _band_stats["결제전환율(%)"] = (
+                    _band_stats["결제건수"]
+                    / _band_stats["전체건수"].replace(0, np.nan) * 100
+                ).round(1).fillna(0)
+
+                # 우상향 막대 + 꺾은선 복합 차트
+                fig_corr = go.Figure()
+                fig_corr.add_trace(go.Bar(
+                    x=_band_stats["점수구간"],
+                    y=_band_stats["결제전환율(%)"],
+                    marker_color=["#e74c3c", "#f39c12", "#2980b9", "#27ae60"],
+                    text=[f"{v}%" for v in _band_stats["결제전환율(%)"]],
+                    textposition="outside",
+                    name="결제 전환율",
+                ))
+                fig_corr.add_trace(go.Scatter(
+                    x=_band_stats["점수구간"],
+                    y=_band_stats["결제전환율(%)"],
+                    mode="lines+markers",
+                    line=dict(color="#8e44ad", width=2.5, dash="dot"),
+                    marker=dict(size=9, color="#8e44ad"),
+                    name="추세선",
+                ))
+                fig_corr.update_layout(
+                    xaxis=dict(
+                        title="AI 품질 점수 구간",
+                        categoryorder="array",
+                        categoryarray=_band_order,
+                    ),
+                    yaxis=dict(title="결제 전환율 (%)", range=[0, 110]),
+                    legend=dict(orientation="h", y=-0.22),
+                    margin=dict(t=30, b=60),
+                    height=400,
+                )
+                st.plotly_chart(fig_corr, use_container_width=True)
+
+                # 상세 수치 표
+                st.dataframe(
+                    _band_stats[["점수구간", "전체건수", "결제건수", "결제전환율(%)"]],
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "점수구간":      st.column_config.TextColumn("AI 점수 구간"),
+                        "전체건수":      st.column_config.NumberColumn("전체 건수"),
+                        "결제건수":      st.column_config.NumberColumn("결제 건수"),
+                        "결제전환율(%)": st.column_config.NumberColumn("결제 전환율", format="%.1f%%"),
+                    },
+                )
+                _match_n  = len(_matched_df)
+                _match_ok = int(_matched_df["결제성공"].sum())
+                st.caption(f"CRM 매칭 성공 {_match_n}건 / 결제 확인 {_match_ok}건 기준")
 
 
 # ══════════════════════════════════════════════════════════
