@@ -849,6 +849,16 @@ def build_analysis_prompts(conversation_text: str, speech_stats: dict, title_met
 8. 감정 분석: 긍정/중립/부정 비율 (합계 1.0)
 9. 위험 신호 문구 목록 (고민, 비쌈, 시간없음 등)
 10. 코칭 멘트 3~5문장
+11. 리드 품질 점수 (1~100점 정수)
+    고객(상담자)의 발화 내용만 분석해 구매 가능성을 아래 기준으로 점수화하세요.
+    · 질문의 구체성 (30점): 막연한 궁금증이 아닌 구체적 준비 방법·일정·비용 질문
+    · 구매 의지 표명 (30점): "해보고 싶다", "시작하려고", "신청하면" 등 적극적 의지 표현
+    · 예산/시간 확보 (20점): 학습 시간·비용 마련 가능 여부 직접 언급
+    · 사전 이해도 (20점): 속기사 직업 사전 조사·구체적 지식 보유 여부
+    기준 없이 무조건 50점으로 설정하지 말 것. 대화 근거에 따라 1~100 전 구간 활용.
+12. 전환 클로징 분석
+    상담이 성공적으로 결제로 이어졌다고 판단할 때 사용됐을 법한 상담사 핵심 클로징 멘트 1~3문장을 추출하세요.
+    고객이 결심을 굳히기 직전에 보인 질문·발화 패턴도 함께 추출하세요.
 
 반드시 아래 JSON 구조로만 반환:
 {{
@@ -864,7 +874,10 @@ def build_analysis_prompts(conversation_text: str, speech_stats: dict, title_met
   "question_patterns": {{"공부기간":0,"시험난이도":0,"수익가능성":0,"가격":0,"취업가능성":0,"기타":0}},
   "sentiment": {{"positive":0.3,"neutral":0.5,"negative":0.2}},
   "risk_signals": [],
-  "coaching": "코칭 멘트"{mand_json}
+  "coaching": "코칭 멘트",
+  "lead_score": 50,
+  "closing_phrases": ["클로징 멘트1","클로징 멘트2"],
+  "decision_signals": ["결심 직전 고객 발화 패턴1"]{mand_json}
 }}"""
 
     return system_text, user_text
@@ -989,6 +1002,9 @@ def build_record(content_id, title, start_time, result, speech_stats, segment_co
         "sentiment":          result.get("sentiment", {"positive": 0.33, "neutral": 0.34, "negative": 0.33}),
         "risk_signals":       result.get("risk_signals", []),
         "coaching":           result.get("coaching", ""),
+        "lead_score":         int(result.get("lead_score", 50)),
+        "closing_phrases":    result.get("closing_phrases", []),
+        "decision_signals":   result.get("decision_signals", []),
         "mandatory_check":    parse_mandatory_check(result.get("mandatory_check", {})),
         "speech_stats":       speech_stats,
         "segment_count":      segment_count,
@@ -1378,20 +1394,35 @@ with st.sidebar:
     f_counselor = st.selectbox("상담자 선택", ["전체 보기"] + _analyzed_staff, key="sb_counselor")
 
     st.markdown("**기간 필터**")
-    # content_list + analyzed 양쪽에서 날짜 풀 수집 (기본값: 전체 기간)
-    _cl_dates = [parse_date_str(i.get("meetingStartTime","")) for i in content_list]
-    _an_dates = [r["date"] for r in analyzed.values() if r.get("date")]
+    # content_list + analyzed 양쪽에서 날짜 풀 수집
+    _cl_dates  = [parse_date_str(i.get("meetingStartTime","")) for i in content_list]
+    _an_dates  = [r["date"] for r in analyzed.values() if r.get("date")]
     _date_pool = sorted(set(d for d in _cl_dates + _an_dates if d))
+
+    # 기본값: 당월 1일 ~ 오늘 (데이터 범위 내로 클램프)
+    _today_date   = datetime.now().date()
+    _month_1st    = _today_date.replace(day=1)
+
     if _date_pool:
         _fd_min = datetime.strptime(_date_pool[0],  "%Y-%m-%d").date()
         _fd_max = datetime.strptime(_date_pool[-1], "%Y-%m-%d").date()
+        _def_start = max(_fd_min, _month_1st)
+        _def_end   = min(_fd_max, _today_date)
+        # 데이터가 모두 이번 달 이전인 경우 전체 기간으로 폴백
+        if _def_start > _def_end:
+            _def_start, _def_end = _fd_min, _fd_max
+        # key="sb_daterange" → 첫 로드 시 기본값 적용, 이후 사용자 변경 값 유지
         date_range = st.date_input(
-            "기간", value=(_fd_min, _fd_max),
+            "기간", value=(_def_start, _def_end),
+            min_value=_fd_min, max_value=_fd_max,
             label_visibility="collapsed",
+            key="sb_daterange",
         )
         if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
             if date_range[0] == _fd_min and date_range[1] == _fd_max:
                 st.caption("전체 기간")
+            elif date_range[0] == _month_1st and date_range[1] == _today_date:
+                st.caption(f"이번 달 ({date_range[0]} ~ {date_range[1]})")
             else:
                 st.caption(f"{date_range[0]} ~ {date_range[1]}")
     else:
@@ -1525,8 +1556,16 @@ with tab_dash:
     records_all      = list(analyzed.values())
     records_filtered = apply_filters(records_all)
 
-    if not records_filtered:
-        # 미분석 상태: content_list 기반 현황
+    # ── CRM 데이터 최상단 로드 (분석 결과 유무 무관) ──
+    _crm_df = pd.DataFrame()
+    _crm_load_error = ""
+    try:
+        _crm_df = load_crm_data()
+    except Exception as _e:
+        _crm_load_error = str(_e)
+
+    # ── 미분석 상태 + CRM 없음: 업로드 현황만 표시 ──
+    if not records_filtered and _crm_df.empty:
         if content_list:
             df_all       = pd.DataFrame(content_list)
             df_all["날짜"]   = df_all["meetingStartTime"].apply(parse_date_str)
@@ -1550,294 +1589,692 @@ with tab_dash:
         st.info("좌측 **시작** 버튼으로 자동 분석을 시작하세요.")
 
     else:
-        # ── KPI ──
-        scores    = [r["total_score"] for r in records_filtered]
-        avg_score = round(sum(scores) / len(scores), 1)
-        cnt_S = sum(1 for s in scores if s >= 95)
-        cnt_A = sum(1 for s in scores if 85 <= s < 95)
-        cnt_B = sum(1 for s in scores if 70 <= s < 85)
-        cnt_C = sum(1 for s in scores if 55 <= s < 70)
-        cnt_D = sum(1 for s in scores if s < 55)
-        flow_ok = sum(1 for r in records_filtered if sum(r.get("flow_stages",{}).values()) >= 4)
-        n = len(records_filtered)
+        # ── CRM 매칭 (분석 결과 있을 때만) ──
+        _merged_df   = merge_timblo_crm(records_filtered, _crm_df) if records_filtered and not _crm_df.empty else pd.DataFrame()
+        _matched_df  = _merged_df[_merged_df.get("crm_matched", pd.Series(False, index=_merged_df.index)) == True].copy() if not _merged_df.empty and "crm_matched" in _merged_df.columns else pd.DataFrame()
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("분석 완료",   f"{n}건")
-        c2.metric("평균 점수",   f"{avg_score}점",
-                  delta=score_grade(avg_score))
-        c3.metric("S+A (우수)",  f"{cnt_S+cnt_A}건",
-                  f"{(cnt_S+cnt_A)/n*100:.0f}%")
-        c4.metric("B (양호)",    f"{cnt_B}건",
-                  f"{cnt_B/n*100:.0f}%")
-        c5.metric("C+D (개선)",  f"{cnt_C+cnt_D}건",
-                  f"-{(cnt_C+cnt_D)/n*100:.0f}%" if cnt_C+cnt_D else "0%")
-        c6.metric("흐름 완성",   f"{flow_ok}건")
+        def _is_purchased(val: str) -> bool:
+            return any(kw in str(val).strip() for kw in _PURCHASE_POSITIVE)
+
+        # 실제 결제 전환율 계산
+        _crm_conv_rate = 0.0
+        _crm_match_n   = 0
+        if not _matched_df.empty and "crm_구입여부" in _matched_df.columns:
+            _matched_df["결제성공"] = _matched_df["crm_구입여부"].apply(_is_purchased)
+            _crm_match_n   = len(_matched_df)
+            _crm_conv_rate = round(_matched_df["결제성공"].sum() / max(_crm_match_n, 1) * 100, 1)
+
+        # 업로드 누락 인원 계산 (당월 기준 — 직원 고유 인원수)
+        _nurak_alert_n = 0
+        if not _crm_df.empty and "상담직원_key" in _crm_df.columns:
+            _kpi_today     = datetime.now().date()
+            _kpi_month_1st = _kpi_today.replace(day=1)
+            _kpi_month_str = _kpi_month_1st.strftime("%Y-%m-%d")
+            _kpi_today_str = _kpi_today.strftime("%Y-%m-%d")
+            # CRM: 당월 데이터만
+            if "상담날짜_dt" in _crm_df.columns:
+                _crm_kpi = _crm_df[
+                    (_crm_df["상담날짜_dt"] >= pd.Timestamp(_kpi_month_1st)) &
+                    (_crm_df["상담날짜_dt"] <= pd.Timestamp(_kpi_today))
+                ]
+            else:
+                _crm_kpi = _crm_df
+            # 팀블로: 당월 업로드만
+            _timblo_src2 = st.session_state.get("content_list_all") or content_list or []
+            _t2_rows = []
+            for _item2 in _timblo_src2:
+                _dt2 = parse_date_str(_item2.get("meetingStartTime", ""))
+                if not _dt2 or _dt2 < _kpi_month_str or _dt2 > _kpi_today_str:
+                    continue
+                _p2  = parse_title(_item2.get("editedTitle") or _item2.get("title", ""))
+                _br2 = _p2.get("branch", "") or "미확인"
+                _s2  = re.sub(r"\s+", "", _p2.get("staff", "") or "")
+                if _s2: _t2_rows.append({"지사": _br2, "직원명_key": _s2})
+            _t2_cnt = (pd.DataFrame(_t2_rows).groupby(["지사","직원명_key"]).size().reset_index(name="업로드건수")
+                       if _t2_rows else pd.DataFrame(columns=["지사","직원명_key","업로드건수"]))
+            _crm_grp2 = (_crm_kpi.groupby(["지사_crm","상담직원_key"]).size()
+                         .reset_index(name="crm건수").rename(columns={"지사_crm":"지사","상담직원_key":"직원명_key"}))
+            _nr2 = _crm_grp2.merge(_t2_cnt, on=["지사","직원명_key"], how="left")
+            _nr2["업로드건수"] = _nr2["업로드건수"].fillna(0).astype(int)
+            _nr2["누락건수"]   = (_nr2["crm건수"] - _nr2["업로드건수"]).clip(lower=0)
+            # 직원별 총 누락 합계 기준 고유 인원수
+            _nr2_person    = _nr2.groupby(["지사","직원명_key"])["누락건수"].sum().reset_index()
+            _nurak_alert_n = int((_nr2_person["누락건수"] >= 5).sum())
+
+        # ════════════════════════════════════════════
+        # ① KPI 카드 4개 (슬림 구성)
+        # ════════════════════════════════════════════
+        scores        = [r["total_score"] for r in records_filtered] if records_filtered else []
+        avg_score     = round(sum(scores) / len(scores), 1) if scores else 0.0
+        _today_str    = datetime.now().strftime("%Y-%m-%d")
+        _today_upload = sum(1 for r in analyzed.values() if r.get("date") == _today_str)
+
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric("평균 AI 점수", f"{avg_score}점",
+                    delta=score_grade(avg_score) if scores else None)
+        if _crm_match_n:
+            kpi2.metric("실제 결제 전환율", f"{_crm_conv_rate}%",
+                        f"CRM 매칭 {_crm_match_n}건 기준")
+        else:
+            kpi2.metric("실제 결제 전환율", "CRM 데이터 없음")
+        if _nurak_alert_n:
+            kpi3.metric("5건 이상 누락 인원", f"{_nurak_alert_n}명",
+                        delta="즉시 확인 필요", delta_color="inverse")
+        else:
+            kpi3.metric("5건 이상 누락 인원", "없음" if not _crm_df.empty else "CRM 미연결")
+        kpi4.metric("오늘 업로드", f"{_today_upload}건")
 
         st.markdown("---")
 
-        # ── 상담방식별 + 지사별 ──
-        col_mode, col_branch = st.columns(2)
+        # ════════════════════════════════════════════
+        # ② 직원별 상담방식별 업로드 현황 표 (당월 피벗)
+        # ════════════════════════════════════════════
+        _emp_today     = datetime.now().date()
+        _emp_month_1st = _emp_today.replace(day=1)
+        _emp_today_str = _emp_today.strftime("%Y-%m-%d")
+        _emp_month_str = _emp_month_1st.strftime("%Y-%m-%d")
 
-        mode_data: dict = {}
-        for r in records_filtered:
-            m = parse_title(r.get("title","")).get("mode","기타") or "기타"
-            mode_data.setdefault(m, []).append(r["total_score"])
-        if mode_data:
-            m_df = pd.DataFrame([{"상담방식": m, "건수": len(v),
-                                   "평균점수": round(sum(v)/len(v),1)}
-                                  for m, v in mode_data.items()]).sort_values("평균점수", ascending=False)
-            with col_mode:
-                st.markdown("**상담방식별 평균 점수**")
-                fig_m = px.bar(m_df, x="상담방식", y="평균점수",
-                               color="평균점수", color_continuous_scale="RdYlGn",
-                               range_y=[0,100], text="평균점수")
-                fig_m.update_traces(texttemplate="%{text}점", textposition="outside")
-                fig_m.update_layout(coloraxis_showscale=False, margin=dict(t=10,b=10), height=260)
-                st.plotly_chart(fig_m, use_container_width=True)
+        st.subheader("📋 직원별 상담 업로드 현황")
+        st.caption(
+            f"기준: {_emp_month_str} ~ {_emp_today_str} (당월) | "
+            "방문·비대면·전화 방식별 CRM vs 팀블로 비교 | 이번 달 업로드 직원만 표시 | 총 누락 5건↑ 빨간 하이라이트"
+        )
 
-        branch_data: dict = {}
-        for r in records_filtered:
-            b = parse_title(r.get("title","")).get("branch","미확인") or "미확인"
-            branch_data.setdefault(b, []).append(r["total_score"])
-        if branch_data:
-            b_df = pd.DataFrame([{"지사": b, "건수": len(v),
-                                   "평균점수": round(sum(v)/len(v),1)}
-                                  for b, v in branch_data.items()]).sort_values("평균점수", ascending=True)
-            with col_branch:
-                st.markdown("**지사별 평균 점수 랭킹**")
-                fig_b = px.bar(b_df, x="평균점수", y="지사", orientation="h",
-                               color="평균점수", color_continuous_scale="RdYlGn",
-                               range_x=[0,100], text="평균점수")
-                fig_b.update_traces(texttemplate="%{text}점", textposition="outside")
-                fig_b.update_layout(coloraxis_showscale=False, margin=dict(t=10,b=10), height=260)
-                st.plotly_chart(fig_b, use_container_width=True)
+        if not _crm_df.empty and "상담방식_crm" in _crm_df.columns:
+            # ── CRM: 당월 데이터만 필터링
+            if "상담날짜_dt" in _crm_df.columns:
+                _crm_month = _crm_df[
+                    (_crm_df["상담날짜_dt"] >= pd.Timestamp(_emp_month_1st)) &
+                    (_crm_df["상담날짜_dt"] <= pd.Timestamp(_emp_today))
+                ].copy()
+            else:
+                _crm_month = _crm_df.copy()
 
-        st.markdown("---")
+            # 직원 원본명 매핑
+            _emp_name_map = (
+                _crm_df.drop_duplicates("상담직원_key").set_index("상담직원_key")["상담직원"].to_dict()
+                if "상담직원" in _crm_df.columns else {}
+            )
 
-        # ── 6대 지표 레이더 + 직원 랭킹 ──
-        col_radar, col_srank = st.columns([2, 3])
+            # ── CRM 롱 테이블: 지사+직원+방식별
+            _emp_crm_long = (
+                _crm_month.groupby(["지사_crm", "상담직원_key", "상담방식_crm"])
+                .size().reset_index(name="cnt")
+                .rename(columns={"지사_crm": "지사", "상담직원_key": "직원명_key",
+                                  "상담방식_crm": "상담방식"})
+            )
+            _emp_crm_long["직원명"] = (
+                _emp_crm_long["직원명_key"].map(_emp_name_map).fillna(_emp_crm_long["직원명_key"])
+            )
 
-        with col_radar:
-            _radar_label = f"{f_counselor} vs 전체 평균" if f_counselor != "전체 보기" else "품질 지표 평균"
-            st.markdown(f"**{_radar_label}**")
-            # 동적 카테고리: 레코드별 rubric_used 또는 quality_scores 키 수집
-            seen_cats: dict = {}  # 삽입 순서 보존
-            for r in records_filtered:
-                rubric_r = r.get("rubric_used") or []
-                if rubric_r:
-                    for row in rubric_r:
-                        seen_cats.setdefault(row["항목"], None)
+            # ── 팀블로: 당월 업로드 건수 롱 테이블
+            _timblo_emp_src = st.session_state.get("content_list_all") or content_list or []
+            _emp_rows = []
+            for _it in _timblo_emp_src:
+                _dt_str = parse_date_str(_it.get("meetingStartTime", ""))
+                if not _dt_str or _dt_str < _emp_month_str or _dt_str > _emp_today_str:
+                    continue
+                _pe   = parse_title(_it.get("editedTitle") or _it.get("title", ""))
+                _br_e = _pe.get("branch", "") or "미확인"
+                _st_e = re.sub(r"\s+", "", _pe.get("staff", "") or "")
+                _md_e = _pe.get("mode", "") or "기타"
+                if _st_e:
+                    _emp_rows.append({"지사": _br_e, "직원명_key": _st_e, "상담방식": _md_e})
+
+            if not _emp_rows:
+                st.info("이번 달 업로드 내역이 없습니다.")
+            else:
+                _emp_timblo_long = (
+                    pd.DataFrame(_emp_rows)
+                    .groupby(["지사", "직원명_key", "상담방식"]).size()
+                    .reset_index(name="업로드건수")
+                )
+
+                # ── CRM 피벗 (방문/비대면/전화 열)
+                _crm_wide = _emp_crm_long.pivot_table(
+                    index=["지사", "직원명_key", "직원명"],
+                    columns="상담방식", values="cnt",
+                    aggfunc="sum", fill_value=0,
+                ).reset_index()
+                _crm_wide.columns.name = None
+                _crm_modes = [c for c in _crm_wide.columns if c not in ["지사","직원명_key","직원명"]]
+                _crm_wide  = _crm_wide.rename(columns={m: f"{m}_CRM" for m in _crm_modes})
+
+                # ── 팀블로 피벗 (방문/비대면/전화 열)
+                _up_wide = _emp_timblo_long.pivot_table(
+                    index=["지사", "직원명_key"],
+                    columns="상담방식", values="업로드건수",
+                    aggfunc="sum", fill_value=0,
+                ).reset_index()
+                _up_wide.columns.name = None
+                _up_modes = [c for c in _up_wide.columns if c not in ["지사","직원명_key"]]
+                _up_wide  = _up_wide.rename(columns={m: f"{m}_업로드" for m in _up_modes})
+
+                # ── 피벗 병합
+                _emp_wide = _crm_wide.merge(_up_wide, on=["지사","직원명_key"], how="left").fillna(0)
+
+                # 3가지 방식 컬럼 보장 (데이터 없는 방식도 0으로)
+                for _m in ["방문", "비대면", "전화"]:
+                    for _sfx in ["_CRM", "_업로드"]:
+                        if f"{_m}{_sfx}" not in _emp_wide.columns:
+                            _emp_wide[f"{_m}{_sfx}"] = 0
+                    _emp_wide[f"{_m}_CRM"]    = _emp_wide[f"{_m}_CRM"].astype(int)
+                    _emp_wide[f"{_m}_업로드"] = _emp_wide[f"{_m}_업로드"].astype(int)
+
+                # ── 총합 및 지표
+                _emp_wide["총_CRM"]      = _emp_wide["방문_CRM"]    + _emp_wide["비대면_CRM"]    + _emp_wide["전화_CRM"]
+                _emp_wide["총_업로드"]   = _emp_wide["방문_업로드"] + _emp_wide["비대면_업로드"] + _emp_wide["전화_업로드"]
+                _emp_wide["총_누락"]     = (_emp_wide["총_CRM"] - _emp_wide["총_업로드"]).clip(lower=0)
+                _emp_wide["업로드율(%)"] = (
+                    _emp_wide["총_업로드"] / _emp_wide["총_CRM"].replace(0, np.nan) * 100
+                ).round(1).fillna(0)
+
+                # ── 이번 달 업로드 1건 이상 직원만 표시
+                _emp_wide = _emp_wide[_emp_wide["총_업로드"] > 0].copy()
+
+                if _emp_wide.empty:
+                    st.info("이번 달 업로드 내역이 없습니다.")
                 else:
-                    for k in r.get("quality_scores", {}):
-                        seen_cats.setdefault(k, None)
-            cats = list(seen_cats.keys()) or list(QUALITY_WEIGHTS.keys())
-            qs_agg = {k: [] for k in cats}
-            for r in records_filtered:
-                qs = r.get("quality_scores", {})
-                for k in cats:
-                    if k in qs:
-                        qs_agg[k].append(qs[k])
-            qs_avg = {k: round(sum(v)/len(v)/5*100, 1) if v else 0 for k, v in qs_agg.items()}
-            vals = [qs_avg.get(c, 0) for c in cats]
-            # 선택 상담자 오버레이
-            _overlay_vals = None
-            if f_counselor != "전체 보기":
-                _counsel_recs = [r for r in records_filtered
-                                 if parse_title(r.get("title","")).get("staff","") == f_counselor]
-                if _counsel_recs:
-                    _c_agg = {k: [] for k in cats}
-                    for r in _counsel_recs:
-                        qs = r.get("quality_scores", {})
-                        for k in cats:
-                            if k in qs: _c_agg[k].append(qs[k])
-                    _overlay_vals = [
-                        round(sum(v)/len(v)/5*100, 1) if v else 0
-                        for v in [_c_agg[k] for k in cats]
+                    _emp_wide = _emp_wide.sort_values(["총_누락","총_CRM"], ascending=[False, False])
+
+                    # 고유 인원 기준 경고 (총 누락 합계 >= 5인 직원 수)
+                    _emp_alert_n = int((_emp_wide["총_누락"] >= 5).sum())
+                    if _emp_alert_n:
+                        st.warning(f"⚠️ 총 누락 5건 이상 직원: **{_emp_alert_n}명** — 즉시 업로드 독촉 필요")
+
+                    def _style_emp_wide(row):
+                        return (
+                            ["background-color: #fce8e8"] * len(row)
+                            if row["총_누락"] >= 5 else [""] * len(row)
+                        )
+
+                    _disp_cols = [
+                        "지사", "직원명",
+                        "방문_CRM", "방문_업로드",
+                        "비대면_CRM", "비대면_업로드",
+                        "전화_CRM", "전화_업로드",
+                        "총_누락", "업로드율(%)",
                     ]
-            st.plotly_chart(
-                make_radar_chart(cats, vals,
-                                 overlay_vals=_overlay_vals,
-                                 overlay_name=f_counselor),
-                use_container_width=True,
-            )
-
-        with col_srank:
-            st.markdown("**직원별 평균 점수 (상위 15명)**")
-            staff_data: dict = {}
-            for r in records_filtered:
-                s = parse_title(r.get("title","")).get("staff","") or r.get("counselor","미확인")
-                staff_data.setdefault(s, []).append(r["total_score"])
-            if staff_data:
-                s_df = pd.DataFrame([{"직원명": s, "건수": len(v),
-                                       "평균점수": round(sum(v)/len(v),1)}
-                                      for s, v in staff_data.items()]) \
-                           .sort_values("평균점수", ascending=False).head(15)
-                fig_s = px.bar(s_df, x="직원명", y="평균점수",
-                               color="평균점수", color_continuous_scale="RdYlGn",
-                               range_y=[0,100], text="평균점수")
-                fig_s.update_traces(texttemplate="%{text}점", textposition="outside")
-                fig_s.update_layout(coloraxis_showscale=False, margin=dict(t=10,b=10),
-                                    height=360, xaxis_tickangle=-30)
-                st.plotly_chart(fig_s, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── 키워드 + 질문패턴 + 감정 ──
-        col_kw, col_qp, col_sent = st.columns(3)
-
-        with col_kw:
-            st.markdown("**고객 키워드 TOP 15**")
-            kw_cnt: dict = {}
-            for r in records_filtered:
-                for kw in r.get("customer_keywords", []):
-                    kw_cnt[kw] = kw_cnt.get(kw, 0) + 1
-            if kw_cnt:
-                kw_df = pd.DataFrame(list(kw_cnt.items()), columns=["키워드","빈도"])
-                kw_df = kw_df.sort_values("빈도", ascending=True).tail(15)
-                fig_kw = px.bar(kw_df, x="빈도", y="키워드", orientation="h",
-                                color_discrete_sequence=["#7986CB"])
-                fig_kw.update_layout(margin=dict(t=10,b=10), height=340, xaxis_title="")
-                st.plotly_chart(fig_kw, use_container_width=True)
-            else:
-                st.caption("AI 분석 후 표시됩니다")
-
-        with col_qp:
-            st.markdown("**질문 패턴 빈도**")
-            qp_agg: dict = {c: 0 for c in QUESTION_CATS}
-            for r in records_filtered:
-                for cat, cnt in r.get("question_patterns", {}).items():
-                    if cat in qp_agg: qp_agg[cat] += cnt
-            qp_df = pd.DataFrame(list(qp_agg.items()), columns=["주제","빈도"]) \
-                        .sort_values("빈도", ascending=True)
-            fig_qp = px.bar(qp_df, x="빈도", y="주제", orientation="h",
-                            color_discrete_sequence=["#26A69A"])
-            fig_qp.update_layout(margin=dict(t=10,b=10), height=340, xaxis_title="")
-            st.plotly_chart(fig_qp, use_container_width=True)
-
-        with col_sent:
-            st.markdown("**감정 비율 (고객 발화)**")
-            n_r = len(records_filtered)
-            sp = sum(r.get("sentiment",{}).get("positive",0.33) for r in records_filtered) / n_r
-            sn = sum(r.get("sentiment",{}).get("neutral",0.34)  for r in records_filtered) / n_r
-            sg = sum(r.get("sentiment",{}).get("negative",0.33) for r in records_filtered) / n_r
-            st.plotly_chart(make_sentiment_pie({"positive":sp,"neutral":sn,"negative":sg}),
-                            use_container_width=True)
-            risk_all: list = []
-            for r in records_filtered: risk_all.extend(r.get("risk_signals",[]))
-            if risk_all:
-                risk_cnt: dict = {}
-                for rs in risk_all: risk_cnt[rs] = risk_cnt.get(rs, 0) + 1
-                top5 = sorted(risk_cnt.items(), key=lambda x: x[1], reverse=True)[:5]
-                st.markdown("**위험 신호 TOP 5**")
-                for rs, cnt in top5: st.caption(f"⚠️ {rs} ({cnt}건)")
+                    _emp_final = (
+                        _emp_wide[[c for c in _disp_cols if c in _emp_wide.columns]]
+                        .reset_index(drop=True)
+                    )
+                    st.dataframe(
+                        _emp_final.style.apply(_style_emp_wide, axis=1),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "지사":         st.column_config.TextColumn("지사"),
+                            "직원명":       st.column_config.TextColumn("직원명"),
+                            "방문_CRM":     st.column_config.NumberColumn("방문 CRM",     format="%d건"),
+                            "방문_업로드":  st.column_config.NumberColumn("방문 업로드",  format="%d건"),
+                            "비대면_CRM":   st.column_config.NumberColumn("비대면 CRM",   format="%d건"),
+                            "비대면_업로드":st.column_config.NumberColumn("비대면 업로드",format="%d건"),
+                            "전화_CRM":     st.column_config.NumberColumn("전화 CRM",     format="%d건"),
+                            "전화_업로드":  st.column_config.NumberColumn("전화 업로드",  format="%d건"),
+                            "총_누락":      st.column_config.NumberColumn("총 누락",      format="%d건"),
+                            "업로드율(%)":  st.column_config.ProgressColumn(
+                                "업로드율", min_value=0, max_value=100, format="%.1f%%"
+                            ),
+                        },
+                    )
+        elif not _crm_df.empty:
+            st.info("CRM 시트에 상담방식(Y열) 데이터가 없어 방식별 비교가 불가합니다.")
+        else:
+            st.info("CRM 시트 연동 후 직원별 현황이 표시됩니다.")
 
         st.markdown("---")
 
-        # ── 기간별 추이 ──
-        if len(records_filtered) >= 2:
-            t_data = [{"날짜": r["date"], "점수": r["total_score"]}
-                      for r in records_filtered if r.get("date")]
-            if t_data:
-                t_df  = pd.DataFrame(t_data)
-                t_df["날짜"] = pd.to_datetime(t_df["날짜"])
-                t_agg = t_df.groupby("날짜")["점수"].mean().round(1).reset_index()
-                fig_t = px.line(t_agg, x="날짜", y="점수", markers=True, range_y=[0,100],
-                                color_discrete_sequence=["royalblue"])
-                fig_t.add_hline(y=85, line_dash="dot", line_color="green",
-                                annotation_text="우수(85점)", annotation_position="bottom right")
-                fig_t.add_hline(y=60, line_dash="dot", line_color="red",
-                                annotation_text="개선필요(60점)", annotation_position="top right")
-                fig_t.update_layout(margin=dict(t=20,b=20), hovermode="x unified")
-                st.subheader("기간별 점수 추이")
-                st.plotly_chart(fig_t, use_container_width=True)
+        if records_filtered:
+            # ════════════════════════════════════════════
+            # ② 중단 1열: 품질 지표 레이더  |  AI점수×결제전환율
+            # ════════════════════════════════════════════
+            col_radar, col_conv = st.columns(2)
 
-        # ── 결과 테이블 ──
-        st.markdown("---")
-        st.subheader("분석 결과 테이블")
-        _tbl_mand_items = st.session_state.user_config.get("mandatory_items", [])
-        rows = []
-        for r in records_filtered:
-            p  = parse_title(r.get("title",""))
-            mc = r.get("mandatory_check", {})
-
-            # 필수 안내: 항목별 ✅/❌ 개별 나열 (비율/숫자 표기 금지)
-            if _tbl_mand_items:
-                mand_parts = []
-                for mi in _tbl_mand_items:
-                    raw_val = mc.get(mi) if mc else None
-                    if raw_val is None:
-                        done = False
-                    elif isinstance(raw_val, dict):
-                        done = _coerce_done(raw_val.get("done", False))
+            with col_radar:
+                _radar_label = f"{f_counselor} vs 전체 평균" if f_counselor != "전체 보기" else "품질 지표 레이더"
+                st.markdown(f"**{_radar_label}**")
+                seen_cats: dict = {}
+                for r in records_filtered:
+                    rubric_r = r.get("rubric_used") or []
+                    if rubric_r:
+                        for row in rubric_r:
+                            seen_cats.setdefault(row["항목"], None)
                     else:
-                        done = _coerce_done(raw_val)
-                    mand_parts.append(("✅ " if done else "❌ ") + mi)
-                if not mc:  # 아직 mandatory_check 없는 레코드
-                    mand_text = "  |  ".join("❓ " + mi for mi in _tbl_mand_items)
+                        for k in r.get("quality_scores", {}):
+                            seen_cats.setdefault(k, None)
+                cats = list(seen_cats.keys()) or list(QUALITY_WEIGHTS.keys())
+                qs_agg = {k: [] for k in cats}
+                for r in records_filtered:
+                    qs = r.get("quality_scores", {})
+                    for k in cats:
+                        if k in qs: qs_agg[k].append(qs[k])
+                qs_avg = {k: round(sum(v)/len(v)/5*100, 1) if v else 0 for k, v in qs_agg.items()}
+                vals = [qs_avg.get(c, 0) for c in cats]
+                _overlay_vals = None
+                if f_counselor != "전체 보기":
+                    _counsel_recs = [r for r in records_filtered
+                                     if parse_title(r.get("title","")).get("staff","") == f_counselor]
+                    if _counsel_recs:
+                        _c_agg = {k: [] for k in cats}
+                        for r in _counsel_recs:
+                            qs = r.get("quality_scores", {})
+                            for k in cats:
+                                if k in qs: _c_agg[k].append(qs[k])
+                        _overlay_vals = [
+                            round(sum(v)/len(v)/5*100, 1) if v else 0
+                            for v in [_c_agg[k] for k in cats]
+                        ]
+                st.plotly_chart(
+                    make_radar_chart(cats, vals, overlay_vals=_overlay_vals, overlay_name=f_counselor),
+                    use_container_width=True,
+                )
+
+            with col_conv:
+                st.markdown("**AI 점수별 실제 결제 전환율**")
+                if not _matched_df.empty and "crm_구입여부" in _matched_df.columns:
+                    def _score_band(score: float) -> str:
+                        if score >= 90: return "90점 이상"
+                        if score >= 80: return "80점대"
+                        if score >= 70: return "70점대"
+                        return "60점 이하"
+                    _band_order = ["60점 이하", "70점대", "80점대", "90점 이상"]
+                    _mb = _matched_df.copy()
+                    _mb["점수구간"] = _mb["total_score"].apply(_score_band)
+                    _band_stats = (
+                        _mb.groupby("점수구간")
+                        .agg(전체건수=("결제성공", "count"), 결제건수=("결제성공", "sum"))
+                        .reindex(_band_order).fillna(0).reset_index()
+                    )
+                    _band_stats["결제전환율(%)"] = (
+                        _band_stats["결제건수"]
+                        / _band_stats["전체건수"].replace(0, np.nan) * 100
+                    ).round(1).fillna(0)
+                    fig_corr = go.Figure()
+                    fig_corr.add_trace(go.Bar(
+                        x=_band_stats["점수구간"], y=_band_stats["결제전환율(%)"],
+                        marker_color=["#e74c3c","#f39c12","#2980b9","#27ae60"],
+                        text=[f"{v}%" for v in _band_stats["결제전환율(%)"]],
+                        textposition="outside", name="결제 전환율",
+                    ))
+                    fig_corr.add_trace(go.Scatter(
+                        x=_band_stats["점수구간"], y=_band_stats["결제전환율(%)"],
+                        mode="lines+markers",
+                        line=dict(color="#8e44ad", width=2.5, dash="dot"),
+                        marker=dict(size=9, color="#8e44ad"), name="추세선",
+                    ))
+                    fig_corr.update_layout(
+                        xaxis=dict(title="AI 점수 구간", categoryorder="array",
+                                   categoryarray=_band_order),
+                        yaxis=dict(title="결제 전환율 (%)", range=[0, 110]),
+                        legend=dict(orientation="h", y=-0.22),
+                        margin=dict(t=20, b=50), height=340,
+                    )
+                    st.plotly_chart(fig_corr, use_container_width=True)
+                    st.caption(f"CRM 매칭 {_crm_match_n}건 / 결제 {int(_matched_df['결제성공'].sum())}건 기준")
                 else:
-                    mand_text = "  |  ".join(mand_parts)
+                    st.info("CRM 매칭 데이터가 없습니다.\n팀블로 제목의 상담자명·직원명이 CRM 시트와 일치해야 합니다.")
+
+            st.markdown("---")
+
+            # ════════════════════════════════════════════
+            # ③ 중단 2열: 고객 키워드 TOP15  |  위험 신호 TOP5
+            # ════════════════════════════════════════════
+            col_kw, col_risk = st.columns(2)
+
+            with col_kw:
+                st.markdown("**고객 키워드 TOP 15**")
+                kw_cnt: dict = {}
+                for r in records_filtered:
+                    for kw in r.get("customer_keywords", []):
+                        kw_cnt[kw] = kw_cnt.get(kw, 0) + 1
+                if kw_cnt:
+                    kw_df = pd.DataFrame(list(kw_cnt.items()), columns=["키워드","빈도"])
+                    kw_df = kw_df.sort_values("빈도", ascending=True).tail(15)
+                    fig_kw = px.bar(kw_df, x="빈도", y="키워드", orientation="h",
+                                    color_discrete_sequence=["#7986CB"])
+                    fig_kw.update_layout(margin=dict(t=10, b=10), height=360, xaxis_title="")
+                    st.plotly_chart(fig_kw, use_container_width=True)
+                else:
+                    st.caption("AI 분석 후 표시됩니다.")
+
+            with col_risk:
+                st.markdown("**위험 신호 (거절 사유) TOP 5**")
+                risk_all: list = []
+                for r in records_filtered:
+                    risk_all.extend(r.get("risk_signals", []))
+                if risk_all:
+                    risk_cnt: dict = {}
+                    for rs in risk_all:
+                        risk_cnt[rs] = risk_cnt.get(rs, 0) + 1
+                    top5 = sorted(risk_cnt.items(), key=lambda x: x[1], reverse=True)[:5]
+                    for i, (rs, cnt) in enumerate(top5):
+                        _rank_color = ["#c0392b","#e74c3c","#e67e22","#f39c12","#f1c40f"][i]
+                        st.markdown(
+                            f'<div style="background:#fff8f8;border-left:4px solid {_rank_color};'
+                            f'border-radius:6px;padding:10px 14px;margin:6px 0;font-size:14px;">'
+                            f'<b>#{i+1}</b> ⚠️ {rs} <span style="color:#888;font-size:12px;">({cnt}건)</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.caption("탐지된 위험 신호 없음")
+
+            st.markdown("---")
+
+            # ════════════════════════════════════════════
+            # ④ 매출 전환 분석 (리드 점수 + 전환 성공 패턴)
+            # ════════════════════════════════════════════
+            st.subheader("💰 매출 전환 분석")
+
+            # ── 리드 점수 보유 레코드만 추출
+            _lead_recs = [r for r in records_filtered if r.get("lead_score", 0) > 0]
+
+            # ── CRM 매칭 데이터로 전환 여부 판단
+            _conv_lead_scores:     list = []   # 전환 성공 리드 점수
+            _no_conv_lead_scores:  list = []   # 미전환 리드 점수
+
+            if not _matched_df.empty and "crm_구입여부" in _matched_df.columns and _lead_recs:
+                _lead_id_map = {r["id"]: r.get("lead_score", 50) for r in _lead_recs}
+                for _, _mrow in _matched_df.iterrows():
+                    _ls = _lead_id_map.get(_mrow.get("id"))
+                    if _ls is None:
+                        continue
+                    if _is_purchased(_mrow.get("crm_구입여부", "")):
+                        _conv_lead_scores.append(_ls)
+                    else:
+                        _no_conv_lead_scores.append(_ls)
+
+            # ── KPI: 전환 성공 리드 평균 점수
+            _conv_avg_lead = round(sum(_conv_lead_scores) / len(_conv_lead_scores), 1) if _conv_lead_scores else None
+            _all_avg_lead  = round(sum(r.get("lead_score", 50) for r in _lead_recs) / max(len(_lead_recs), 1), 1) if _lead_recs else None
+
+            _lcol1, _lcol2, _lcol3 = st.columns(3)
+            if _conv_avg_lead is not None:
+                _lcol1.metric("전환 성공 리드 평균 점수", f"{_conv_avg_lead}점",
+                              help="결제 완료된 상담의 고객 리드 점수 평균")
             else:
-                mand_text = "-"
+                _lcol1.metric("전환 성공 리드 평균 점수", "데이터 부족")
+            if _all_avg_lead is not None:
+                _lcol2.metric("전체 리드 평균 점수", f"{_all_avg_lead}점")
+            else:
+                _lcol2.metric("전체 리드 평균 점수", "분석 전")
+            _lcol3.metric("전환 성공 건수", f"{len(_conv_lead_scores)}건" if _conv_lead_scores else "CRM 매칭 필요")
 
-            rows.append({
-                "날짜":     r["date"],
-                "상담방식": p["mode"],
-                "지사":     p["branch"],
-                "직원명":   p["staff"],
-                "상담자":   p["client"],
-                "총점":     r["total_score"],
-                "등급":     score_grade(r["total_score"]),
-                "엔진":     r.get("engine",""),
-                "흐름":     f"{sum(r.get('flow_stages',{}).values())}/{len(r.get('flow_stages',{})) or 6}",
-                "필수 안내": mand_text,
-            })
+            st.markdown("")
 
-        # components.html → overflow-x:auto 보장 (st.dataframe clipping 해결)
-        def _score_color(s):
-            if s >= 85: return "#27ae60"
-            if s >= 70: return "#2980b9"
-            if s >= 60: return "#f39c12"
-            return "#e74c3c"
+            # ── 리드 점수별 전환율 차트 (X: 점수구간, Y: 전환율%)
+            _col_lead_chart, _col_success = st.columns(2)
 
-        _tbl_body = ""
-        for row in rows:
-            sc  = row["총점"]
-            col = _score_color(sc)
-            # 필수 안내 셀: ✅/❌ 뱃지로 변환
-            _mand_html = ""
-            for part in row["필수 안내"].split("  |  "):
-                part = part.strip()
-                if part.startswith("✅"):
-                    _mand_html += (f'<span style="background:#e8f8f0;border:1px solid #27ae60;'
-                                   f'border-radius:10px;padding:2px 7px;margin:2px;'
-                                   f'white-space:nowrap;font-size:12px;">{part}</span>')
-                elif part.startswith("❌"):
-                    _mand_html += (f'<span style="background:#fdf2f2;border:1px solid #e74c3c;'
-                                   f'border-radius:10px;padding:2px 7px;margin:2px;'
-                                   f'white-space:nowrap;font-size:12px;">{part}</span>')
-                elif part.startswith("❓"):
-                    _mand_html += (f'<span style="background:#f9f9f9;border:1px solid #bbb;'
-                                   f'border-radius:10px;padding:2px 7px;margin:2px;'
-                                   f'white-space:nowrap;font-size:12px;">{part}</span>')
+            with _col_lead_chart:
+                st.markdown("**📈 리드 점수 구간별 실제 결제 전환율**")
+                if _conv_lead_scores or _no_conv_lead_scores:
+                    _all_leads_with_conv = (
+                        [(s, True)  for s in _conv_lead_scores] +
+                        [(s, False) for s in _no_conv_lead_scores]
+                    )
+                    def _lead_band(score: int) -> str:
+                        b = (score // 10) * 10
+                        return f"{b}~{b+9}점"
+                    _band_order = [f"{b}~{b+9}점" for b in range(0, 100, 10)]
+                    _lband_stats: dict = {b: {"total": 0, "conv": 0} for b in _band_order}
+                    for ls, conv in _all_leads_with_conv:
+                        b = _lead_band(ls)
+                        if b in _lband_stats:
+                            _lband_stats[b]["total"] += 1
+                            if conv: _lband_stats[b]["conv"] += 1
+                    _lband_df = pd.DataFrame([
+                        {"점수구간": b,
+                         "전체건수": v["total"],
+                         "전환율(%)": round(v["conv"] / v["total"] * 100, 1) if v["total"] else 0}
+                        for b, v in _lband_stats.items()
+                        if v["total"] > 0
+                    ])
+                    if not _lband_df.empty:
+                        fig_lead = go.Figure()
+                        fig_lead.add_trace(go.Bar(
+                            x=_lband_df["점수구간"], y=_lband_df["전환율(%)"],
+                            marker_color=["#27ae60" if v >= 50 else "#e74c3c" if v < 25 else "#f39c12"
+                                          for v in _lband_df["전환율(%)"]],
+                            text=[f"{v}%" for v in _lband_df["전환율(%)"]],
+                            textposition="outside", name="전환율",
+                        ))
+                        fig_lead.add_trace(go.Scatter(
+                            x=_lband_df["점수구간"], y=_lband_df["전환율(%)"],
+                            mode="lines+markers",
+                            line=dict(color="#8e44ad", width=2.5, dash="dot"),
+                            marker=dict(size=8, color="#8e44ad"), name="추세선",
+                        ))
+                        fig_lead.update_layout(
+                            xaxis=dict(title="리드 점수 구간"),
+                            yaxis=dict(title="전환율 (%)", range=[0, 110]),
+                            legend=dict(orientation="h", y=-0.25),
+                            margin=dict(t=20, b=60), height=340,
+                        )
+                        st.plotly_chart(fig_lead, use_container_width=True)
+                        st.caption(f"CRM 매칭 총 {len(_conv_lead_scores)+len(_no_conv_lead_scores)}건 기준")
+                    else:
+                        st.caption("데이터가 부족합니다.")
                 else:
-                    _mand_html += f'<span style="font-size:12px">{part}</span>'
+                    st.info("CRM 매칭 + 리드 점수 분석 데이터가 필요합니다.")
 
-            _tbl_body += (
-                f'<tr style="border-bottom:1px solid #eee;">'
-                f'<td style="white-space:nowrap;padding:6px 10px;">{row["날짜"]}</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;">{row["상담방식"]}</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;">{row["지사"]}</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;font-weight:600;">{row["직원명"]}</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;">{row["상담자"]}</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;color:{col};font-weight:700;">{sc:.1f}점</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;color:{col};">{row["등급"]}</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;">{row["엔진"]}</td>'
-                f'<td style="white-space:nowrap;padding:6px 10px;">{row["흐름"]}</td>'
-                f'<td style="padding:6px 10px;min-width:380px;">{_mand_html if row["필수 안내"] != "-" else "-"}</td>'
-                f'</tr>'
-            )
+            # ── 전환 성공 케이스 공통점 도출
+            with _col_success:
+                st.markdown("**🏆 전환 성공 상담의 3가지 공통점**")
+                # 전환 성공 레코드 ID 집합
+                _conv_ids: set = set()
+                if not _matched_df.empty and "crm_구입여부" in _matched_df.columns:
+                    _conv_ids = set(
+                        _matched_df[_matched_df["crm_구입여부"].apply(_is_purchased)]["id"].tolist()
+                    )
+                _success_recs = [r for r in records_filtered if r.get("id") in _conv_ids]
 
-        _tbl_html = f"""
+                if _success_recs:
+                    # ① 공통 클로징 멘트 집계
+                    _closing_cnt: dict = {}
+                    for r in _success_recs:
+                        for ph in r.get("closing_phrases", []):
+                            _closing_cnt[ph] = _closing_cnt.get(ph, 0) + 1
+                    _top_closing = sorted(_closing_cnt.items(), key=lambda x: x[1], reverse=True)[:3]
+
+                    # ② 결심 직전 고객 발화 패턴
+                    _decision_cnt: dict = {}
+                    for r in _success_recs:
+                        for ds in r.get("decision_signals", []):
+                            _decision_cnt[ds] = _decision_cnt.get(ds, 0) + 1
+                    _top_decision = sorted(_decision_cnt.items(), key=lambda x: x[1], reverse=True)[:3]
+
+                    # ③ 공통 강점 키워드
+                    _str_cnt: dict = {}
+                    for r in _success_recs:
+                        for s in r.get("strengths", []):
+                            _str_cnt[s] = _str_cnt.get(s, 0) + 1
+                    _top_str = sorted(_str_cnt.items(), key=lambda x: x[1], reverse=True)[:3]
+
+                    st.markdown(
+                        f'<div style="background:#f0fff4;border-left:4px solid #27ae60;'
+                        f'border-radius:6px;padding:10px 14px;margin:4px 0;">'
+                        f'<b>🗣 공통 클로징 멘트</b></div>',
+                        unsafe_allow_html=True,
+                    )
+                    if _top_closing:
+                        for ph, cnt in _top_closing:
+                            st.markdown(
+                                f'<div style="background:#f9fffe;border:1px solid #a8e6c4;'
+                                f'border-radius:4px;padding:6px 12px;margin:3px 0;font-size:13px;">'
+                                f'💬 {ph} <span style="color:#888;font-size:11px;">({cnt}건)</span></div>',
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("클로징 멘트 데이터 없음 (재분석 필요)")
+
+                    st.markdown(
+                        f'<div style="background:#fff9e6;border-left:4px solid #f39c12;'
+                        f'border-radius:6px;padding:10px 14px;margin:8px 0 4px;">'
+                        f'<b>🔑 결심 직전 고객 발화 패턴</b></div>',
+                        unsafe_allow_html=True,
+                    )
+                    if _top_decision:
+                        for ds, cnt in _top_decision:
+                            st.markdown(
+                                f'<div style="background:#fffdf0;border:1px solid #f5d88e;'
+                                f'border-radius:4px;padding:6px 12px;margin:3px 0;font-size:13px;">'
+                                f'🙋 {ds} <span style="color:#888;font-size:11px;">({cnt}건)</span></div>',
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("패턴 데이터 없음 (재분석 필요)")
+
+                    st.markdown(
+                        f'<div style="background:#f0f4ff;border-left:4px solid #4169E1;'
+                        f'border-radius:6px;padding:10px 14px;margin:8px 0 4px;">'
+                        f'<b>✨ 공통 상담사 강점</b></div>',
+                        unsafe_allow_html=True,
+                    )
+                    for s, cnt in _top_str[:3]:
+                        st.markdown(
+                            f'<div style="background:#f5f8ff;border:1px solid #b3c6ff;'
+                            f'border-radius:4px;padding:6px 12px;margin:3px 0;font-size:13px;">'
+                            f'⭐ {s} <span style="color:#888;font-size:11px;">({cnt}건)</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                    st.caption(f"전환 성공 {len(_success_recs)}건 기준 분석")
+                else:
+                    st.info(
+                        "CRM 매칭 후 결제 완료 케이스가 있으면\n"
+                        "공통 패턴을 자동 추출합니다.\n\n"
+                        "※ 기존 분석 결과는 🔄 재분석으로 클로징 멘트를 추가 추출할 수 있습니다."
+                    )
+
+            st.markdown("---")
+
+        # ════════════════════════════════════════════
+        if _crm_load_error:
+            st.info(f"📋 CRM 연동 오류 — {_crm_load_error[:100]}")
+
+        if records_filtered:
+            # ════════════════════════════════════════════
+            # ④-B 상담방식별 Top 5 랭킹
+            # ════════════════════════════════════════════
+            st.subheader("🏆 상담방식별 Top 5 랭킹")
+            _ch_cols = st.columns(3)
+            for _ch_key, _ch_col in [("방문", _ch_cols[0]), ("비대면", _ch_cols[1]), ("전화", _ch_cols[2])]:
+                _ch_recs = [r for r in records_filtered
+                            if _ch_key in (parse_title(r.get("title","")).get("mode","") or "")]
+                with _ch_col:
+                    st.markdown(f"**{_ch_key} 상담 Top 5**")
+                    if _ch_recs:
+                        _ch_staff: dict = {}
+                        for r in _ch_recs:
+                            s = parse_title(r.get("title","")).get("staff","") or "미확인"
+                            _ch_staff.setdefault(s, []).append(r["total_score"])
+                        _ch_df = pd.DataFrame([
+                            {"직원명": s, "건수": len(v), "평균점수": round(sum(v)/len(v), 1)}
+                            for s, v in _ch_staff.items()
+                        ]).sort_values("평균점수", ascending=False).head(5).reset_index(drop=True)
+                        _ch_df.index = _ch_df.index + 1
+                        st.dataframe(_ch_df, use_container_width=True, hide_index=False,
+                                     column_config={
+                                         "직원명":   st.column_config.TextColumn("직원명"),
+                                         "건수":     st.column_config.NumberColumn("건수", format="%d건"),
+                                         "평균점수": st.column_config.ProgressColumn(
+                                             "평균점수", min_value=0, max_value=100, format="%.1f점"),
+                                     })
+                    else:
+                        st.caption("해당 방식 데이터 없음")
+
+            st.markdown("---")
+
+            # ════════════════════════════════════════════
+            # 기간별 추이
+            # ════════════════════════════════════════════
+            if len(records_filtered) >= 2:
+                t_data = [{"날짜": r["date"], "점수": r["total_score"]}
+                          for r in records_filtered if r.get("date")]
+                if t_data:
+                    t_df  = pd.DataFrame(t_data)
+                    t_df["날짜"] = pd.to_datetime(t_df["날짜"])
+                    t_agg = t_df.groupby("날짜")["점수"].mean().round(1).reset_index()
+                    fig_t = px.line(t_agg, x="날짜", y="점수", markers=True, range_y=[0, 100],
+                                    color_discrete_sequence=["royalblue"])
+                    fig_t.add_hline(y=85, line_dash="dot", line_color="green",
+                                    annotation_text="우수(85점)", annotation_position="bottom right")
+                    fig_t.add_hline(y=60, line_dash="dot", line_color="red",
+                                    annotation_text="개선필요(60점)", annotation_position="top right")
+                    fig_t.update_layout(margin=dict(t=20, b=20), hovermode="x unified")
+                    st.subheader("기간별 점수 추이")
+                    st.plotly_chart(fig_t, use_container_width=True)
+                    st.markdown("---")
+
+            # ════════════════════════════════════════════
+            # 분석 결과 테이블
+            # ════════════════════════════════════════════
+            st.subheader("분석 결과 테이블")
+            _tbl_mand_items = st.session_state.user_config.get("mandatory_items", [])
+            rows = []
+            for r in records_filtered:
+                p  = parse_title(r.get("title",""))
+                mc = r.get("mandatory_check", {})
+                if _tbl_mand_items:
+                    mand_parts = []
+                    for mi in _tbl_mand_items:
+                        raw_val = mc.get(mi) if mc else None
+                        if raw_val is None:           done = False
+                        elif isinstance(raw_val, dict): done = _coerce_done(raw_val.get("done", False))
+                        else:                           done = _coerce_done(raw_val)
+                        mand_parts.append(("✅ " if done else "❌ ") + mi)
+                    mand_text = ("  |  ".join("❓ " + mi for mi in _tbl_mand_items)
+                                 if not mc else "  |  ".join(mand_parts))
+                else:
+                    mand_text = "-"
+                rows.append({
+                    "날짜": r["date"], "상담방식": p["mode"], "지사": p["branch"],
+                    "직원명": p["staff"], "상담자": p["client"],
+                    "총점": r["total_score"], "등급": score_grade(r["total_score"]),
+                    "엔진": r.get("engine",""),
+                    "흐름": f"{sum(r.get('flow_stages',{}).values())}/{len(r.get('flow_stages',{})) or 6}",
+                    "필수 안내": mand_text,
+                })
+
+            def _score_color(s):
+                if s >= 85: return "#27ae60"
+                if s >= 70: return "#2980b9"
+                if s >= 60: return "#f39c12"
+                return "#e74c3c"
+
+            _tbl_body = ""
+            for row in rows:
+                sc = row["총점"]; col = _score_color(sc)
+                _mand_html = ""
+                for part in row["필수 안내"].split("  |  "):
+                    part = part.strip()
+                    if part.startswith("✅"):
+                        _mand_html += (f'<span style="background:#e8f8f0;border:1px solid #27ae60;'
+                                       f'border-radius:10px;padding:2px 7px;margin:2px;'
+                                       f'white-space:nowrap;font-size:12px;">{part}</span>')
+                    elif part.startswith("❌"):
+                        _mand_html += (f'<span style="background:#fdf2f2;border:1px solid #e74c3c;'
+                                       f'border-radius:10px;padding:2px 7px;margin:2px;'
+                                       f'white-space:nowrap;font-size:12px;">{part}</span>')
+                    elif part.startswith("❓"):
+                        _mand_html += (f'<span style="background:#f9f9f9;border:1px solid #bbb;'
+                                       f'border-radius:10px;padding:2px 7px;margin:2px;'
+                                       f'white-space:nowrap;font-size:12px;">{part}</span>')
+                    else:
+                        _mand_html += f'<span style="font-size:12px">{part}</span>'
+                _tbl_body += (
+                    f'<tr style="border-bottom:1px solid #eee;">'
+                    f'<td style="white-space:nowrap;padding:6px 10px;">{row["날짜"]}</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;">{row["상담방식"]}</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;">{row["지사"]}</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;font-weight:600;">{row["직원명"]}</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;">{row["상담자"]}</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;color:{col};font-weight:700;">{sc:.1f}점</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;color:{col};">{row["등급"]}</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;">{row["엔진"]}</td>'
+                    f'<td style="white-space:nowrap;padding:6px 10px;">{row["흐름"]}</td>'
+                    f'<td style="padding:6px 10px;min-width:380px;">{_mand_html if row["필수 안내"] != "-" else "-"}</td>'
+                    f'</tr>'
+                )
+            _tbl_html = f"""
 <div style="overflow-x:auto;overflow-y:auto;max-height:480px;
             border:1px solid #e0e0e0;border-radius:8px;font-family:sans-serif;">
   <table style="border-collapse:collapse;width:max-content;font-size:13px;">
@@ -1858,472 +2295,87 @@ with tab_dash:
     <tbody>{_tbl_body}</tbody>
   </table>
 </div>"""
-        components.html(_tbl_html, height=min(520, 60 + 40 * len(rows)), scrolling=False)
-
-        # ── 지사/직원별 상담방식 통계 피벗 표 ──
-        st.markdown("---")
-        st.subheader("지사/직원별 상담방식 통계")
-        _pv_rows = []
-        for r in records_filtered:
-            p = parse_title(r.get("title",""))
-            _pv_rows.append({
-                "지사":     p["branch"] or "미확인",
-                "직원명":   p["staff"]  or "미확인",
-                "상담방식": p["mode"]   or "미분류",
-            })
-        if _pv_rows:
-            _pv_df = pd.DataFrame(_pv_rows)
-            _pivot = (
-                pd.crosstab([_pv_df["지사"], _pv_df["직원명"]], _pv_df["상담방식"])
-                .fillna(0).astype(int)
-            )
-            _pivot.insert(0, "합계", _pivot.sum(axis=1))
-            _pivot = _pivot.sort_values("합계", ascending=False)
-            st.dataframe(_pivot, use_container_width=True)
-        else:
-            st.info("분석 데이터가 없습니다.")
-
-        # ── 필수 안내 준수율 차트 ──
-        mand_items = st.session_state.user_config.get("mandatory_items", [])
-        # 분석 완료 레코드 전체 대상 (mandatory_check 없는 구버전 레코드도 미준수로 집계)
-        mand_records = records_filtered
-        mand_analyzed = [r for r in mand_records if r.get("mandatory_check")]
-        if mand_items and mand_analyzed:
+            components.html(_tbl_html, height=min(520, 60 + 40 * len(rows)), scrolling=False)
             st.markdown("---")
-            st.subheader("필수 안내 준수율")
-            mand_stats = []
-            for item in mand_items:
-                done_count = 0
-                for r in mand_analyzed:
-                    raw_val = r.get("mandatory_check", {}).get(item)
-                    if raw_val is None:
-                        continue
-                    # 구버전(dict with note) / 신버전(dict with evidence) / 직접 bool 모두 처리
-                    if isinstance(raw_val, dict):
-                        done_raw = raw_val.get("done", raw_val.get("준수", False))
-                    else:
-                        done_raw = raw_val
-                    if _coerce_done(done_raw):
-                        done_count += 1
-                rate = round(done_count / len(mand_analyzed) * 100, 1)
-                mand_stats.append({"항목": item, "준수율(%)": rate,
-                                   "준수": done_count, "미준수": len(mand_analyzed) - done_count,
-                                   "분석건수": len(mand_analyzed)})
-            mand_df = pd.DataFrame(mand_stats).sort_values("준수율(%)", ascending=True)
-            fig_mand = px.bar(mand_df, x="준수율(%)", y="항목", orientation="h",
-                              color="준수율(%)", color_continuous_scale="RdYlGn",
-                              range_x=[0, 100], text="준수율(%)",
-                              hover_data={"준수": True, "미준수": True, "분석건수": True})
-            fig_mand.update_traces(texttemplate="%{text}%", textposition="outside")
-            fig_mand.update_layout(coloraxis_showscale=False, margin=dict(t=10, b=10),
-                                   height=50 + 50 * len(mand_items))
-            st.plotly_chart(fig_mand, use_container_width=True)
-            # 요약 수치 표
-            st.dataframe(mand_df[["항목","준수율(%)","준수","미준수","분석건수"]],
-                         use_container_width=True, hide_index=True)
 
-        # ── 성공 패턴 & Golden Phrases (항상 표시) ──
-        st.markdown("---")
-        st.subheader("💡 AI 전략 인사이트")
-        _excellent_recs = [r for r in records_filtered if r.get("total_score", 0) >= 85]
+            # ════════════════════════════════════════════
+            # 필수 안내 준수율 차트
+            # ════════════════════════════════════════════
+            mand_items = st.session_state.user_config.get("mandatory_items", [])
+            mand_analyzed = [r for r in records_filtered if r.get("mandatory_check")]
+            if mand_items and mand_analyzed:
+                st.subheader("필수 안내 준수율")
+                mand_stats = []
+                for item in mand_items:
+                    done_count = 0
+                    for r in mand_analyzed:
+                        raw_val = r.get("mandatory_check", {}).get(item)
+                        if raw_val is None: continue
+                        done_raw = raw_val.get("done", raw_val.get("준수", False)) if isinstance(raw_val, dict) else raw_val
+                        if _coerce_done(done_raw): done_count += 1
+                    rate = round(done_count / len(mand_analyzed) * 100, 1)
+                    mand_stats.append({"항목": item, "준수율(%)": rate,
+                                       "준수": done_count, "미준수": len(mand_analyzed) - done_count,
+                                       "분석건수": len(mand_analyzed)})
+                mand_df = pd.DataFrame(mand_stats).sort_values("준수율(%)", ascending=True)
+                fig_mand = px.bar(mand_df, x="준수율(%)", y="항목", orientation="h",
+                                  color="준수율(%)", color_continuous_scale="RdYlGn",
+                                  range_x=[0, 100], text="준수율(%)",
+                                  hover_data={"준수": True, "미준수": True, "분석건수": True})
+                fig_mand.update_traces(texttemplate="%{text}%", textposition="outside")
+                fig_mand.update_layout(coloraxis_showscale=False, margin=dict(t=10, b=10),
+                                       height=50 + 50 * len(mand_items))
+                st.plotly_chart(fig_mand, use_container_width=True)
+                st.dataframe(mand_df[["항목","준수율(%)","준수","미준수","분석건수"]],
+                             use_container_width=True, hide_index=True)
+                st.markdown("---")
 
-        if not _excellent_recs:
-            st.info("우수 상담(85점 이상) 데이터가 아직 없습니다. 분석을 더 진행하면 성공 패턴이 자동으로 추출됩니다.")
-        else:
-            st.caption(f"우수 상담(85점 이상) {len(_excellent_recs)}건에서 추출한 핵심 패턴")
-
-            # 성공 키워드: 상담사 키워드 빈도 집계
-            _succ_kw: dict = {}
-            for r in _excellent_recs:
-                for kw in r.get("counselor_keywords", []):
-                    _succ_kw[kw] = _succ_kw.get(kw, 0) + 1
-            _top_kw = sorted(_succ_kw.items(), key=lambda x: x[1], reverse=True)[:12]
-
-            # Golden Phrases: strengths에서 수집
-            _phrases: list = []
-            for r in _excellent_recs:
-                for s in r.get("strengths", []):
-                    if s and s not in _phrases:
-                        _phrases.append(s)
-                if len(_phrases) >= 9:
-                    break
-
-            col_kw_s, col_phrases = st.columns([1, 2])
-            with col_kw_s:
-                st.markdown("**🏅 핵심 성공 키워드**")
-                if _top_kw:
-                    _kw_tags = " ".join(
-                        f'<span style="background:#e8f4fd;border:1px solid #3498db;'
-                        f'border-radius:14px;padding:4px 10px;margin:3px;'
-                        f'display:inline-block;font-size:13px;color:#1a5276;">'
-                        f'{"🔥" if cnt >= 3 else "✦"} {kw} <b>({cnt})</b></span>'
-                        for kw, cnt in _top_kw
-                    )
-                    st.markdown(_kw_tags, unsafe_allow_html=True)
-                else:
-                    st.info("키워드 데이터가 부족합니다.")
-
-            with col_phrases:
-                st.markdown("**💬 Golden Phrases — 설득 핵심 문장**")
-                if _phrases:
-                    for i, phrase in enumerate(_phrases[:6]):
-                        _bg = "#fff9e6" if i % 2 == 0 else "#f0fff4"
-                        st.markdown(
-                            f'<div style="background:{_bg};border-left:4px solid #f39c12;'
-                            f'border-radius:6px;padding:8px 14px;margin:5px 0;'
-                            f'font-size:13.5px;line-height:1.5;">'
-                            f'💬 {phrase}</div>',
-                            unsafe_allow_html=True,
+            # ════════════════════════════════════════════
+            # AI 전략 인사이트
+            # ════════════════════════════════════════════
+            st.subheader("💡 AI 전략 인사이트")
+            _excellent_recs = [r for r in records_filtered if r.get("total_score", 0) >= 85]
+            if not _excellent_recs:
+                st.info("우수 상담(85점 이상) 데이터가 아직 없습니다.")
+            else:
+                st.caption(f"우수 상담(85점 이상) {len(_excellent_recs)}건에서 추출한 핵심 패턴")
+                _succ_kw: dict = {}
+                for r in _excellent_recs:
+                    for kw in r.get("counselor_keywords", []):
+                        _succ_kw[kw] = _succ_kw.get(kw, 0) + 1
+                _top_kw = sorted(_succ_kw.items(), key=lambda x: x[1], reverse=True)[:12]
+                _phrases: list = []
+                for r in _excellent_recs:
+                    for s in r.get("strengths", []):
+                        if s and s not in _phrases: _phrases.append(s)
+                    if len(_phrases) >= 9: break
+                col_kw_s, col_phrases = st.columns([1, 2])
+                with col_kw_s:
+                    st.markdown("**🏅 핵심 성공 키워드**")
+                    if _top_kw:
+                        _kw_tags = " ".join(
+                            f'<span style="background:#e8f4fd;border:1px solid #3498db;'
+                            f'border-radius:14px;padding:4px 10px;margin:3px;'
+                            f'display:inline-block;font-size:13px;color:#1a5276;">'
+                            f'{"🔥" if cnt >= 3 else "✦"} {kw} <b>({cnt})</b></span>'
+                            for kw, cnt in _top_kw
                         )
-                else:
-                    st.info("우수 상담의 강점 데이터가 아직 부족합니다.")
-
-        # ── 상담방식별 Top 5 랭킹 ──
-        st.markdown("---")
-        st.subheader("🏆 상담방식별 Top 5 랭킹")
-        _ch_cols = st.columns(3)
-        _channel_list = [("방문", _ch_cols[0]), ("비대면", _ch_cols[1]), ("전화", _ch_cols[2])]
-        for _ch_key, _ch_col in _channel_list:
-            _ch_recs = [r for r in records_filtered
-                        if _ch_key in (parse_title(r.get("title","")).get("mode","") or "")]
-            with _ch_col:
-                st.markdown(f"**{_ch_key} 상담 Top 5**")
-                if _ch_recs:
-                    _ch_staff: dict = {}
-                    for r in _ch_recs:
-                        s = parse_title(r.get("title","")).get("staff","") or "미확인"
-                        _ch_staff.setdefault(s, []).append(r["total_score"])
-                    _ch_df = pd.DataFrame([
-                        {"직원명": s, "건수": len(v), "평균점수": round(sum(v)/len(v), 1)}
-                        for s, v in _ch_staff.items()
-                    ]).sort_values("평균점수", ascending=False).head(5).reset_index(drop=True)
-                    _ch_df.index = _ch_df.index + 1  # 1-based rank
-                    st.dataframe(
-                        _ch_df,
-                        use_container_width=True,
-                        hide_index=False,
-                        column_config={
-                            "직원명":  st.column_config.TextColumn("직원명"),
-                            "건수":    st.column_config.NumberColumn("건수", format="%d건"),
-                            "평균점수": st.column_config.ProgressColumn(
-                                "평균점수", min_value=0, max_value=100, format="%.1f점"),
-                        },
-                    )
-                else:
-                    st.caption("해당 방식 데이터 없음")
-
-        # ── 전환 가능성 예측 ──
-        st.markdown("---")
-        st.subheader("🎯 전환 가능성 예측")
-
-        def _calc_conversion(r) -> int:
-            base   = r.get("total_score", 0)
-            flow   = r.get("flow_stages", {})
-            f_done = sum(1 for v in flow.values() if v)
-            f_tot  = len(flow) or 6
-            pos    = r.get("sentiment", {}).get("positive", 0.33)
-            risk   = len(r.get("risk_signals", []))
-            score  = base * 0.80 + (f_done / f_tot) * 12 + pos * 8 - risk * 2
-            return int(min(100, max(0, round(score))))
-
-        _staff_conv: dict = {}
-        for r in records_filtered:
-            s = parse_title(r.get("title","")).get("staff","") or "미확인"
-            _staff_conv.setdefault(s, []).append(_calc_conversion(r))
-
-        _conv_df = pd.DataFrame([
-            {"직원명": s, "전환가능성": round(sum(v)/len(v), 1), "건수": len(v)}
-            for s, v in _staff_conv.items()
-        ]).sort_values("전환가능성", ascending=False)
-
-        _avg_conv = round(_conv_df["전환가능성"].mean(), 1) if not _conv_df.empty else 0
-
-        if f_counselor != "전체 보기":
-            # 선택 상담자 metric
-            _sel_rows = _conv_df[_conv_df["직원명"] == f_counselor]
-            if not _sel_rows.empty:
-                _sel_conv = _sel_rows.iloc[0]["전환가능성"]
-                _delta = round(_sel_conv - _avg_conv, 1)
-                col_m1, col_m2, col_m3 = st.columns([1, 1, 3])
-                with col_m1:
-                    st.metric(f"{f_counselor}", f"{_sel_conv}점",
-                              delta=f"{_delta:+.1f} vs 평균")
-                with col_m2:
-                    st.metric("전체 평균", f"{_avg_conv}점")
-            else:
-                st.caption(f"{f_counselor}의 전환 가능성 데이터가 없습니다")
-        else:
-            col_m1, col_m2 = st.columns(2)
-            col_m1.metric("전체 평균 전환가능성", f"{_avg_conv}점")
-            _top_conv = _conv_df.iloc[0] if not _conv_df.empty else None
-            if _top_conv is not None:
-                col_m2.metric(f"최고 ({_top_conv['직원명']})", f"{_top_conv['전환가능성']}점")
-
-        # 막대 차트 + 평균선
-        if not _conv_df.empty:
-            _conv_plot = _conv_df.sort_values("전환가능성", ascending=True).tail(20)
-            _highlight = f_counselor if f_counselor != "전체 보기" else None
-            _colors = [
-                "#e74c3c" if _highlight and row["직원명"] == _highlight else "#3498db"
-                for _, row in _conv_plot.iterrows()
-            ]
-            fig_conv = go.Figure(go.Bar(
-                x=_conv_plot["전환가능성"],
-                y=_conv_plot["직원명"],
-                orientation="h",
-                marker_color=_colors,
-                text=[f"{v}점" for v in _conv_plot["전환가능성"]],
-                textposition="outside",
-            ))
-            fig_conv.add_vline(
-                x=_avg_conv, line_dash="dash", line_color="orange", line_width=2,
-                annotation_text=f"평균 {_avg_conv}점",
-                annotation_position="top right",
-            )
-            fig_conv.update_layout(
-                xaxis=dict(range=[0, 105], title="전환가능성 점수"),
-                margin=dict(t=20, b=20),
-                height=max(280, 32 * len(_conv_plot)),
-            )
-            st.plotly_chart(fig_conv, use_container_width=True)
-
-        # ── 업로드 현황 요약 (분석 결과 테이블과 동일 데이터 기반) ──
-        st.markdown("---")
-        st.subheader("업로드 현황 요약")
-        st.caption("※ 아래 '분석 결과 테이블'과 동일한 기준으로 집계됩니다")
-        if records_filtered:
-            _up_rows = []
-            for r in records_filtered:
-                p = parse_title(r.get("title", ""))
-                _up_rows.append({
-                    "상담방식": p.get("mode") or "미분류",
-                    "지사":     p.get("branch") or "미확인",
-                    "직원명":   p.get("staff") or "미확인",
-                })
-            _up_df = pd.DataFrame(_up_rows)
-
-            col_sum1, col_sum2, col_sum3 = st.columns(3)
-            with col_sum1:
-                st.markdown("**상담방식별**")
-                _mode_sum = (
-                    _up_df.groupby("상담방식").size()
-                    .reset_index(name="건수")
-                    .sort_values("건수", ascending=False)
-                )
-                st.dataframe(_mode_sum, hide_index=True, use_container_width=True,
-                             column_config={"건수": st.column_config.NumberColumn("건수", format="%d건")})
-            with col_sum2:
-                st.markdown("**지사별**")
-                _branch_sum = (
-                    _up_df.groupby("지사").size()
-                    .reset_index(name="건수")
-                    .sort_values("건수", ascending=False)
-                )
-                st.dataframe(_branch_sum, hide_index=True, use_container_width=True,
-                             column_config={"건수": st.column_config.NumberColumn("건수", format="%d건")})
-            with col_sum3:
-                st.markdown("**직원별 (상위 10명)**")
-                _staff_sum = (
-                    _up_df.groupby("직원명").size()
-                    .reset_index(name="건수")
-                    .sort_values("건수", ascending=False)
-                    .head(10)
-                )
-                st.dataframe(_staff_sum, hide_index=True, use_container_width=True,
-                             column_config={"건수": st.column_config.NumberColumn("건수", format="%d건")})
-        else:
-            st.info("분석 데이터가 없습니다.")
-
-        # ══════════════════════════════════════════════════════
-        # CRM 구글 시트 연동 섹션 (secrets.toml 설정 시 활성화)
-        # ══════════════════════════════════════════════════════
-        _crm_df = pd.DataFrame()
-        _crm_load_error = ""
-        if _GSHEETS_OK:
-            try:
-                _crm_df = load_crm_data()
-            except Exception as _e:
-                _crm_load_error = str(_e)
-
-        if not _GSHEETS_OK:
-            pass  # 라이브러리 미설치 → 조용히 무시
-        elif _crm_load_error:
-            st.markdown("---")
-            st.info(f"📋 CRM 구글 시트 미연결 — .streamlit/secrets.toml 설정 후 활성화됩니다. ({_crm_load_error[:80]})")
-        elif not _crm_df.empty:
-            st.markdown("---")
-            st.subheader("📋 CRM 연동 교차 분석")
-
-            # ── ① 지사/직원별 업무 누락 체크 표 ─────────────────────────
-            st.markdown("#### ⚠️ 지사/직원별 업무 누락 체크")
-            st.caption("CRM 실제 상담 건수 vs 팀블로 업로드 건수 비교 | 누락 5건 이상 직원은 빨간 배경으로 표시됩니다.")
-
-            # CRM 기준: 지사 + 직원별 건수
-            _crm_grp = (
-                _crm_df.groupby(["지사_crm", "상담직원_key"])
-                .size()
-                .reset_index(name="실제상담건수_crm")
-                .rename(columns={"지사_crm": "지사", "상담직원_key": "직원명_key"})
-            )
-
-            # 팀블로 기준: content_list_all (전체 업로드, 분석 여부 무관)
-            _timblo_src = st.session_state.get("content_list_all") or content_list or []
-            _timblo_rows = []
-            for _item in _timblo_src:
-                _p = parse_title(_item.get("editedTitle") or _item.get("title", ""))
-                _br  = _p.get("branch", "") or "미확인"
-                _stf = re.sub(r"\s+", "", _p.get("staff", "") or "")
-                if _stf:
-                    _timblo_rows.append({"지사": _br, "직원명_key": _stf})
-
-            if _timblo_rows:
-                _timblo_cnt = (
-                    pd.DataFrame(_timblo_rows)
-                    .groupby(["지사", "직원명_key"])
-                    .size()
-                    .reset_index(name="업로드건수_timblo")
-                )
-            else:
-                _timblo_cnt = pd.DataFrame(columns=["지사", "직원명_key", "업로드건수_timblo"])
-
-            # Left Join: CRM 기준으로 팀블로 건수 병합
-            _nurak_df = _crm_grp.merge(_timblo_cnt, on=["지사", "직원명_key"], how="left")
-            _nurak_df["업로드건수_timblo"] = _nurak_df["업로드건수_timblo"].fillna(0).astype(int)
-            _nurak_df["누락건수"] = (
-                _nurak_df["실제상담건수_crm"] - _nurak_df["업로드건수_timblo"]
-            ).clip(lower=0)
-
-            # 직원명 표시용 원본 이름 복원 (공백 제거 키 → 원본)
-            _staff_name_map = {}
-            if "상담직원" in _crm_df.columns:
-                _staff_name_map = (
-                    _crm_df.drop_duplicates("상담직원_key")
-                    .set_index("상담직원_key")["상담직원"]
-                    .to_dict()
-                )
-            _nurak_df["직원명"] = (
-                _nurak_df["직원명_key"].map(_staff_name_map).fillna(_nurak_df["직원명_key"])
-            )
-            _nurak_df = _nurak_df[["지사", "직원명", "실제상담건수_crm", "업로드건수_timblo", "누락건수"]]
-            _nurak_df = _nurak_df.sort_values(
-                ["누락건수", "실제상담건수_crm"], ascending=[False, False]
-            )
-
-            # 누락 5건 이상 행 배경색 강조 (1~4건은 단순 시간차로 간주하여 제외)
-            def _style_nurak(row):
-                if row["누락건수"] >= 5:
-                    return ["background-color: #fce8e8"] * len(row)
-                return [""] * len(row)
-
-            st.dataframe(
-                _nurak_df.style.apply(_style_nurak, axis=1),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "지사":              st.column_config.TextColumn("지사"),
-                    "직원명":            st.column_config.TextColumn("직원명"),
-                    "실제상담건수_crm":  st.column_config.NumberColumn("실제 상담 건수 (CRM)", format="%d건"),
-                    "업로드건수_timblo": st.column_config.NumberColumn("업로드 건수 (팀블로)", format="%d건"),
-                    "누락건수":          st.column_config.NumberColumn("누락 건수", format="%d건"),
-                },
-            )
-            _alert_cnt = int((_nurak_df["누락건수"] >= 5).sum())
-            if _alert_cnt:
-                st.warning(f"⚠️ 누락 5건 이상 직원: **{_alert_cnt}명** — 즉시 확인이 필요합니다.")
-
-            # ── ② AI 품질 점수 × 실제 결제 전환율 상관관계 차트 ──────────
-            st.markdown("---")
-            st.markdown("#### 📈 AI 품질 점수 × 실제 결제 전환율 상관관계")
-            st.caption('"AI 점수가 높을수록 실제 결제율이 높은가?" — CRM 매칭 데이터 기준')
-
-            _merged_df = merge_timblo_crm(records_filtered, _crm_df)
-            _matched_df = (
-                _merged_df[_merged_df["crm_matched"] == True].copy()
-                if "crm_matched" in _merged_df.columns
-                else pd.DataFrame()
-            )
-
-            if _matched_df.empty:
-                st.info(
-                    "CRM 매칭 데이터가 없습니다. "
-                    "팀블로 제목의 상담자명·직원명이 CRM 시트와 동일하게 입력되어 있는지 확인하세요."
-                )
-            else:
-                # 결제 성공 여부 판별
-                def _is_purchased(val: str) -> bool:
-                    v = str(val).strip()
-                    return any(kw in v for kw in _PURCHASE_POSITIVE)
-
-                _matched_df["결제성공"] = _matched_df["crm_구입여부"].apply(_is_purchased)
-
-                # AI 점수 4구간 분류
-                def _score_band(score: float) -> str:
-                    if score >= 90: return "90점 이상"
-                    if score >= 80: return "80점대"
-                    if score >= 70: return "70점대"
-                    return "60점 이하"
-
-                _matched_df["점수구간"] = _matched_df["total_score"].apply(_score_band)
-
-                _band_order = ["60점 이하", "70점대", "80점대", "90점 이상"]
-                _band_stats = (
-                    _matched_df.groupby("점수구간")
-                    .agg(전체건수=("결제성공", "count"), 결제건수=("결제성공", "sum"))
-                    .reindex(_band_order)
-                    .fillna(0)
-                    .reset_index()
-                )
-                _band_stats["결제전환율(%)"] = (
-                    _band_stats["결제건수"]
-                    / _band_stats["전체건수"].replace(0, np.nan) * 100
-                ).round(1).fillna(0)
-
-                # 우상향 막대 + 꺾은선 복합 차트
-                fig_corr = go.Figure()
-                fig_corr.add_trace(go.Bar(
-                    x=_band_stats["점수구간"],
-                    y=_band_stats["결제전환율(%)"],
-                    marker_color=["#e74c3c", "#f39c12", "#2980b9", "#27ae60"],
-                    text=[f"{v}%" for v in _band_stats["결제전환율(%)"]],
-                    textposition="outside",
-                    name="결제 전환율",
-                ))
-                fig_corr.add_trace(go.Scatter(
-                    x=_band_stats["점수구간"],
-                    y=_band_stats["결제전환율(%)"],
-                    mode="lines+markers",
-                    line=dict(color="#8e44ad", width=2.5, dash="dot"),
-                    marker=dict(size=9, color="#8e44ad"),
-                    name="추세선",
-                ))
-                fig_corr.update_layout(
-                    xaxis=dict(
-                        title="AI 품질 점수 구간",
-                        categoryorder="array",
-                        categoryarray=_band_order,
-                    ),
-                    yaxis=dict(title="결제 전환율 (%)", range=[0, 110]),
-                    legend=dict(orientation="h", y=-0.22),
-                    margin=dict(t=30, b=60),
-                    height=400,
-                )
-                st.plotly_chart(fig_corr, use_container_width=True)
-
-                # 상세 수치 표
-                st.dataframe(
-                    _band_stats[["점수구간", "전체건수", "결제건수", "결제전환율(%)"]],
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={
-                        "점수구간":      st.column_config.TextColumn("AI 점수 구간"),
-                        "전체건수":      st.column_config.NumberColumn("전체 건수"),
-                        "결제건수":      st.column_config.NumberColumn("결제 건수"),
-                        "결제전환율(%)": st.column_config.NumberColumn("결제 전환율", format="%.1f%%"),
-                    },
-                )
-                _match_n  = len(_matched_df)
-                _match_ok = int(_matched_df["결제성공"].sum())
-                st.caption(f"CRM 매칭 성공 {_match_n}건 / 결제 확인 {_match_ok}건 기준")
+                        st.markdown(_kw_tags, unsafe_allow_html=True)
+                    else:
+                        st.info("키워드 데이터 부족")
+                with col_phrases:
+                    st.markdown("**💬 Golden Phrases — 설득 핵심 문장**")
+                    if _phrases:
+                        for i, phrase in enumerate(_phrases[:6]):
+                            _bg = "#fff9e6" if i % 2 == 0 else "#f0fff4"
+                            st.markdown(
+                                f'<div style="background:{_bg};border-left:4px solid #f39c12;'
+                                f'border-radius:6px;padding:8px 14px;margin:5px 0;'
+                                f'font-size:13.5px;line-height:1.5;">💬 {phrase}</div>',
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.info("강점 데이터 부족")
 
 
 # ══════════════════════════════════════════════════════════
