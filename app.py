@@ -283,7 +283,7 @@ _CRM_BRANCHES = ["강남", "가산", "대전", "대구", "광주", "부산"]
 
 # 구글 시트 컬럼 위치 (0-based 인덱스; 헤더 행 제외)
 # A=0, B=1, ... H=7, ... X=23, Y=24, ... AI=34, AJ=35
-_CRM_COL_CUSTOMER = 1    # B열: 가입자명(고객명)
+_CRM_COL_CUSTOMER = 5    # F열: 가입자명(고객명)
 _CRM_COL_DATE     = 7    # H열: 상담 날짜
 _CRM_COL_STAFF    = 23   # X열: 상담 직원
 _CRM_COL_MODE     = 24   # Y열: 상담 방식
@@ -392,10 +392,14 @@ def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
     crm["가입자명"] = crm["가입자명"].astype(str).str.strip()
     crm = crm[~crm["가입자명"].isin(["", "nan", "None"])]
 
+    def _norm_key(s: str) -> str:
+        """이름 내 모든 공백(일반·비분리·전각 등) 제거 후 소문자화"""
+        return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s)).strip()
+
     # 매핑 키: 이름 내 모든 공백 제거 후 비교
-    crm["가입자명_key"] = crm["가입자명"].str.replace(r"\s+", "", regex=True)
+    crm["가입자명_key"] = crm["가입자명"].apply(_norm_key)
     if "상담직원" in crm.columns:
-        crm["상담직원_key"] = crm["상담직원"].astype(str).str.replace(r"\s+", "", regex=True)
+        crm["상담직원_key"] = crm["상담직원"].astype(str).apply(_norm_key)
     else:
         crm["상담직원_key"] = ""
 
@@ -425,11 +429,14 @@ def merge_timblo_crm(records: list, crm_df: pd.DataFrame) -> pd.DataFrame:
     if crm_df.empty or not records:
         return pd.DataFrame(records)
 
+    def _mk(s: str) -> str:
+        return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s or "")).strip()
+
     rows = []
     for r in records:
         p          = parse_title(r.get("title", ""))
-        client_key = re.sub(r"\s+", "", p.get("client", "") or "")
-        staff_key  = re.sub(r"\s+", "", p.get("staff",  "") or "")
+        client_key = _mk(p.get("client", ""))
+        staff_key  = _mk(p.get("staff",  ""))
         row        = dict(r)
 
         # 매칭 시도: 고객명 + 직원명 동시 일치 우선, 고객명만도 허용
@@ -501,26 +508,37 @@ def parse_title(title: str) -> dict:
     """제목에서 상담방식/지사/직원명/상담자를 파싱합니다.
     - 맨 앞의 (신) 등 접두사가 있어도 첫 번째 [...] 를 상담방식으로 인식합니다.
     - 예: (신)[방문]강남_서채윤(남은도) → 방식:방문, 지사:강남, 직원:서채윤, 상담자:남은도
+    파싱 규칙:
+      1. 첫 번째 [...]  → 상담방식
+      2. ] 이후 ~ _    → 지사
+      3. _ 이후 ~ (    → 직원명  (언더바 다음, 첫 괄호 이전)
+      4. 첫 번째 (...) → 상담자명 (괄호 안)
     """
     mode = branch = staff = client_name = ""
     try:
         raw = (title or "").strip()
-        # 접두사 무시: 문자열 내 첫 [...] 를 어디서든 찾음 (^ 앵커 제거)
+        # 1. 상담방식: 첫 번째 [...] 탐색 (접두사 무시)
         m = re.search(r"\[([^\]]+)\]", raw)
         if m:
             mode = m.group(1).strip()
             rest = raw[m.end():]          # ] 이후 문자열
         else:
             rest = raw
-        # ] 뒤 ~ _ 앞 → 지사
+
+        # 2. 지사: _ 이전 부분
         if "_" in rest:
             branch, rest = rest.split("_", 1)
         branch = branch.strip()
-        # 나머지: 직원명(상담자)
-        m2 = re.match(r"([^(（]+)(?:[（(]([^)）]+)[）)])?", rest)
+
+        # 3. 직원명: _ 이후 ~ 첫 번째 ( 이전
+        # 4. 상담자명: 첫 번째 (...) 안
+        m2 = re.match(r"([^(（（]+?)\s*[（(]([^)）)]+)[）)]", rest)
         if m2:
             staff       = m2.group(1).strip()
-            client_name = (m2.group(2) or "").strip()
+            client_name = m2.group(2).strip()
+        else:
+            # 괄호 없는 경우: 남은 전체가 직원명
+            staff = rest.strip()
     except Exception:
         pass  # 파싱 실패 시 빈값 반환, 프로그램 중단 없음
     return {"mode": mode, "branch": branch, "staff": staff, "client": client_name}
