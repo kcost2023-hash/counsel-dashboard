@@ -290,20 +290,24 @@ _CRM_COL_MODE     = 24   # Y열: 상담 방식
 _CRM_COL_PURCHASE = 34   # AI열: 구입 여부 (결제완료 / 예약 / 미결제 등)
 _CRM_COL_PURCH_DT = 35   # AJ열: 구입 날짜
 
-# 결제 성공으로 판단할 구입여부 키워드
-_PURCHASE_POSITIVE = ["결제완료", "예약", "계약", "등록완료", "등록"]
+# 결제 성공 판단 키워드 — 시트 AI열에 정확히 "구입"이 기입된 경우만 전환 성공
+_PURCHASE_KEYWORD = "구입"
 
 # ── CRM 구글 시트 기본 URL (공개 공유 링크 — secrets.toml 없이도 동작) ──
 # 시트가 "링크 있는 모든 사용자 - 뷰어" 이상 공개 상태여야 합니다.
 _CRM_SHEET_ID  = "1N-8DO73uT9tzTQgUYL9EOCdirVW6CrNA6NRJGOR8Wus"
 _CRM_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{_CRM_SHEET_ID}"
 
+# ── CRM 캐시 TTL 설정 ──────────────────────────────────────────────────────
+# 6시간 = 21600초  /  3시간(선희님 요청 시) = 10800초
+_CRM_CACHE_TTL = 21600
 
-@st.cache_data(ttl=600)
+
+@st.cache_data(ttl=_CRM_CACHE_TTL)
 def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
     """
     구글 시트 지사별 탭에서 CRM 데이터를 모두 불러와 하나의 DataFrame으로 병합합니다.
-    @st.cache_data(ttl=600) — 10분 캐시.
+    @st.cache_data(ttl=_CRM_CACHE_TTL) — 6시간 캐시 (변경: _CRM_CACHE_TTL 상수).
 
     ── 인증 방식 (자동 선택) ──────────────────────────────────────────
     방법 A (우선): .streamlit/secrets.toml 에 서비스 계정 설정 시 → st.connection 사용
@@ -348,7 +352,7 @@ def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
                 df_raw = conn.read(
                     spreadsheet=f"https://docs.google.com/spreadsheets/d/{sheet_id}",
                     worksheet=branch,
-                    ttl=600,
+                    ttl=_CRM_CACHE_TTL,
                 )
             else:
                 # ── 방법 B: 공개 시트 CSV 내보내기 (credentials 불필요) ──
@@ -412,6 +416,56 @@ def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
         crm["상담날짜_str"] = ""
 
     return crm
+
+
+@st.cache_data(ttl=_CRM_CACHE_TTL)
+def load_crm_purchase_status(sheet_id: str = _CRM_SHEET_ID) -> dict:
+    """
+    가벼운 결제 상태 전용 로드 — AI열(인덱스 34)과 매칭 키(F열·X열)만 읽어 반환.
+    {(가입자명_key, 상담직원_key): "구입" | ""} 형태의 dict를 반환합니다.
+    load_crm_data()와 동일한 TTL(_CRM_CACHE_TTL)로 캐시되며,
+    대시보드 렌더링 시마다 캐시 만료 여부를 자동으로 확인합니다.
+    """
+    _has_secrets = False
+    if _GSHEETS_OK:
+        try:
+            _has_secrets = bool(st.secrets.get("connections", {}).get("gsheets"))
+        except Exception:
+            pass
+
+    def _norm(s):
+        return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s or "")).strip()
+
+    status_map: dict = {}
+    for branch in _CRM_BRANCHES:
+        try:
+            if _has_secrets:
+                conn   = st.connection("gsheets", type=_GSheetsConnection)
+                df_raw = conn.read(
+                    spreadsheet=f"https://docs.google.com/spreadsheets/d/{sheet_id}",
+                    worksheet=branch,
+                    ttl=_CRM_CACHE_TTL,
+                )
+            else:
+                import urllib.parse
+                csv_url = (
+                    f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+                    f"/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(branch)}"
+                )
+                df_raw = pd.read_csv(csv_url, header=0)
+
+            if df_raw is None or df_raw.empty:
+                continue
+            n = df_raw.shape[1]
+            for _, row in df_raw.iterrows():
+                cust_key  = _norm(row.iloc[_CRM_COL_CUSTOMER]) if _CRM_COL_CUSTOMER < n else ""
+                staff_key = _norm(row.iloc[_CRM_COL_STAFF])    if _CRM_COL_STAFF    < n else ""
+                purch_val = str(row.iloc[_CRM_COL_PURCHASE]).strip() if _CRM_COL_PURCHASE < n else ""
+                if cust_key:
+                    status_map[(cust_key, staff_key)] = purch_val
+        except Exception:
+            pass
+    return status_map
 
 
 def merge_timblo_crm(records: list, crm_df: pd.DataFrame) -> pd.DataFrame:
@@ -1611,8 +1665,22 @@ with tab_dash:
         _merged_df   = merge_timblo_crm(records_filtered, _crm_df) if records_filtered and not _crm_df.empty else pd.DataFrame()
         _matched_df  = _merged_df[_merged_df.get("crm_matched", pd.Series(False, index=_merged_df.index)) == True].copy() if not _merged_df.empty and "crm_matched" in _merged_df.columns else pd.DataFrame()
 
+        # ── 결제 상태 경량 동기화 (_CRM_CACHE_TTL 주기마다 AI열만 재조회) ──
         def _is_purchased(val: str) -> bool:
-            return any(kw in str(val).strip() for kw in _PURCHASE_POSITIVE)
+            # 시트 AI열 값이 정확히 "구입"일 때만 전환 성공으로 판단
+            return str(val).strip() == _PURCHASE_KEYWORD
+
+        if not _matched_df.empty:
+            try:
+                _purch_map = load_crm_purchase_status()
+                def _mk2(s): return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s or "")).strip()
+                def _get_fresh_purch(row):
+                    ck = _mk2(row.get("client", ""))
+                    sk = _mk2(row.get("staff",  ""))
+                    return _purch_map.get((ck, sk), row.get("crm_구입여부", ""))
+                _matched_df["crm_구입여부"] = _matched_df.apply(_get_fresh_purch, axis=1)
+            except Exception:
+                pass  # 동기화 실패 시 기존 매칭 값 유지
 
         # 실제 결제 전환율 계산
         _crm_conv_rate = 0.0
