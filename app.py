@@ -293,6 +293,31 @@ _CRM_COL_PURCH_DT = 35   # AJ열: 구입 날짜
 # 결제 성공 판단 키워드 — 시트 AI열에 정확히 "구입"이 기입된 경우만 전환 성공
 _PURCHASE_KEYWORD = "구입"
 
+# ── 월별 통계 시트 열 인덱스 (YYYY-MM 형식 단일 시트, 17~32행 기준)
+# A=0:지사명  B=1:직원명  Q=16:방문상담  W=22:비대면상담  AC=28:전화상담
+_CRM_SUM_COL_BRANCH = 0   # A열: 지사명
+_CRM_SUM_COL_STAFF  = 1   # B열: 직원명
+_CRM_SUM_COL_VISIT  = 16  # Q열: 방문 상담 건수 (합산)
+_CRM_SUM_COL_ONLINE = 22  # W열: 비대면 상담 건수 (합산)
+_CRM_SUM_COL_PHONE  = 28  # AC열: 전화 상담 건수 (합산)
+# 데이터 영역: 엑셀 16행(제목줄) ~ 32행(이세희)
+# header=None으로 전체 읽기 → iloc[14:32] = 엑셀 15행~32행 → 제목줄 포함
+# 이후 B열 필터로 '직원명'·'합계'·빈칸 제거 → 17행(서채윤)~32행(이세희) 실데이터만 남음
+_CRM_SUM_ROW_START  = 14  # iloc 시작: 엑셀 15행 (제목줄 포함)
+_CRM_SUM_ROW_END    = 32  # iloc 끝(exclusive): 엑셀 32행(이세희) 포함
+
+def _norm_key(s) -> str:
+    """이름 비교용 정규화: 일반공백·비분리공백(\\u00a0)·전각공백(\\u3000)·zero-width(\\u200b) 모두 제거."""
+    return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s or "")).strip()
+
+def _pure_korean(s) -> str:
+    """이름에서 한글(가-힣)만 추출. 괄호·특수문자·숫자·영문·공백 모두 제거.
+    (신)·[방문] 등 접두사가 남아 있어도 순수 한글 이름 비교가 가능해진다.
+    주의: 최소 2자 미만이면 빈 문자열 반환 (오탐 방지).
+    """
+    k = re.sub(r"[^가-힣]", "", str(s or ""))
+    return k if len(k) >= 2 else ""
+
 # ── CRM 구글 시트 기본 URL (공개 공유 링크 — secrets.toml 없이도 동작) ──
 # 시트가 "링크 있는 모든 사용자 - 뷰어" 이상 공개 상태여야 합니다.
 _CRM_SHEET_ID  = "1N-8DO73uT9tzTQgUYL9EOCdirVW6CrNA6NRJGOR8Wus"
@@ -304,10 +329,13 @@ _CRM_CACHE_TTL = 21600
 
 
 @st.cache_data(ttl=_CRM_CACHE_TTL)
-def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
+def load_crm_data(sheet_id: str = _CRM_SHEET_ID, cutoff_date: str = "") -> pd.DataFrame:
     """
     구글 시트 지사별 탭에서 CRM 데이터를 모두 불러와 하나의 DataFrame으로 병합합니다.
     @st.cache_data(ttl=_CRM_CACHE_TTL) — 6시간 캐시 (변경: _CRM_CACHE_TTL 상수).
+
+    cutoff_date: "YYYY-MM-DD" 형식. 호출 시 오늘 날짜를 전달하면 날짜가 바뀔 때마다
+    캐시 키가 달라져 자동으로 새 캐시 엔트리가 생성됩니다 (미래 날짜 완전 차단).
 
     ── 인증 방식 (자동 선택) ──────────────────────────────────────────
     방법 A (우선): .streamlit/secrets.toml 에 서비스 계정 설정 시 → st.connection 사용
@@ -383,6 +411,28 @@ def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
             sub = df_raw.iloc[:, list(valid.values())].copy()
             sub.columns = list(valid.keys())
             sub["지사_crm"] = branch
+
+            # ▶ 날짜 다형식 파싱: "2024.03.15" / "2024/03/15" / "2024-03-15" 모두 인식
+            if "상담날짜" in sub.columns:
+                _date_str = (
+                    sub["상담날짜"].astype(str)
+                    .str.strip()
+                    .str.replace(r"[./]", "-", regex=True)   # 마침표·슬래시 → 하이픈
+                )
+                sub["상담날짜_dt"] = pd.to_datetime(_date_str, errors="coerce")
+            else:
+                sub["상담날짜_dt"] = pd.NaT
+            sub["상담날짜_dt"] = sub["상담날짜_dt"].astype("datetime64[ns]")
+
+            # ▶▶ 루프 내 즉시 가지치기: 미래 행을 브랜치 단위로 영구 삭제
+            #    cutoff_date 파라미터(호출 시 오늘 날짜)를 사용 → 캐시 고정 문제 없음
+            _cutoff = pd.Timestamp(cutoff_date) if cutoff_date else pd.Timestamp(datetime.now().date())
+            sub = sub.loc[
+                sub["상담날짜_dt"].notna() & (sub["상담날짜_dt"] <= _cutoff)
+            ].copy()
+            if sub.empty:
+                continue
+
             frames.append(sub)
         except Exception:
             pass    # 개별 시트 실패 시 나머지 계속 진행
@@ -396,24 +446,30 @@ def load_crm_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
     crm["가입자명"] = crm["가입자명"].astype(str).str.strip()
     crm = crm[~crm["가입자명"].isin(["", "nan", "None"])]
 
-    def _norm_key(s: str) -> str:
-        """이름 내 모든 공백(일반·비분리·전각 등) 제거 후 소문자화"""
-        return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s)).strip()
-
-    # 매핑 키: 이름 내 모든 공백 제거 후 비교
+    # 매핑 키: 이름 내 모든 공백 제거 후 비교 (모듈 레벨 _norm_key 사용)
     crm["가입자명_key"] = crm["가입자명"].apply(_norm_key)
     if "상담직원" in crm.columns:
         crm["상담직원_key"] = crm["상담직원"].astype(str).apply(_norm_key)
     else:
         crm["상담직원_key"] = ""
 
-    # 날짜 정규화
-    if "상담날짜" in crm.columns:
-        crm["상담날짜_dt"]  = pd.to_datetime(crm["상담날짜"], errors="coerce")
-        crm["상담날짜_str"] = crm["상담날짜_dt"].dt.strftime("%Y-%m-%d").fillna("")
-    else:
-        crm["상담날짜_dt"]  = pd.NaT
-        crm["상담날짜_str"] = ""
+    # 날짜 정규화 — 상담날짜_dt는 각 sub에서 이미 생성됨, str 열만 추가
+    if "상담날짜_dt" not in crm.columns:
+        crm["상담날짜_dt"] = pd.to_datetime(
+            crm["상담날짜"].astype(str).str.strip().str.replace(r"[./]", "-", regex=True)
+            if "상담날짜" in crm.columns else pd.Series(dtype="object"),
+            errors="coerce",
+        ).astype("datetime64[ns]")
+
+    # timezone 제거 (Google Sheets가 tz-aware 반환 시 비교 오류 방지)
+    if hasattr(crm["상담날짜_dt"].dtype, "tz") and crm["상담날짜_dt"].dt.tz is not None:
+        crm["상담날짜_dt"] = crm["상담날짜_dt"].dt.tz_localize(None)
+
+    crm["상담날짜_str"] = crm["상담날짜_dt"].dt.strftime("%Y-%m-%d").fillna("")
+
+    # ▶ 2차 방어: concat 후 재확인 (루프에서 이미 처리됐지만 확실히)
+    _today_cutoff = pd.Timestamp(cutoff_date) if cutoff_date else pd.Timestamp(datetime.now().date())
+    crm = crm[crm["상담날짜_dt"].notna() & (crm["상담날짜_dt"] <= _today_cutoff)].copy()
 
     return crm
 
@@ -432,9 +488,6 @@ def load_crm_purchase_status(sheet_id: str = _CRM_SHEET_ID) -> dict:
             _has_secrets = bool(st.secrets.get("connections", {}).get("gsheets"))
         except Exception:
             pass
-
-    def _norm(s):
-        return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s or "")).strip()
 
     status_map: dict = {}
     for branch in _CRM_BRANCHES:
@@ -458,14 +511,210 @@ def load_crm_purchase_status(sheet_id: str = _CRM_SHEET_ID) -> dict:
                 continue
             n = df_raw.shape[1]
             for _, row in df_raw.iterrows():
-                cust_key  = _norm(row.iloc[_CRM_COL_CUSTOMER]) if _CRM_COL_CUSTOMER < n else ""
-                staff_key = _norm(row.iloc[_CRM_COL_STAFF])    if _CRM_COL_STAFF    < n else ""
+                cust_key  = _norm_key(row.iloc[_CRM_COL_CUSTOMER]) if _CRM_COL_CUSTOMER < n else ""
+                staff_key = _norm_key(row.iloc[_CRM_COL_STAFF])    if _CRM_COL_STAFF    < n else ""
                 purch_val = str(row.iloc[_CRM_COL_PURCHASE]).strip() if _CRM_COL_PURCHASE < n else ""
                 if cust_key:
                     status_map[(cust_key, staff_key)] = purch_val
         except Exception:
             pass
     return status_map
+
+
+@st.cache_data(ttl=_CRM_CACHE_TTL)
+def load_crm_summary(sheet_name: str = "") -> pd.DataFrame:
+    """
+    YYYY-MM 월별 시트 17~32행에서 직원별 합산 상담 건수를 반환합니다 (요약 통계 전용).
+
+    반환: summary_df
+       열: [지사, 직원명, 직원명_key, 방문_CRM, 비대면_CRM, 전화_CRM]
+
+    행 범위:
+      header=None 기준: 엑셀 1행=iloc[0] → iloc[14:32] = 엑셀 15~32행
+      이후 B열 필터로 헤더·합계·빈칸 제거 → 엑셀 17행(서채윤)~32행(이세희) 실데이터만 남음
+
+    매출 전환 분석용 상세 결제 데이터는 load_crm_detailed_matching_data() 를 사용하세요.
+    """
+    import urllib.parse
+
+    _has_secrets = False
+    if _GSHEETS_OK:
+        try:
+            _has_secrets = bool(st.secrets.get("connections", {}).get("gsheets"))
+        except Exception:
+            pass
+
+    _ws = sheet_name if sheet_name else datetime.now().strftime("%Y-%m")
+
+    # ═══════════════════════════════════════════════════════════
+    # PART A — YYYY-MM 월별 시트 → summary_df (17~32행)
+    # ═══════════════════════════════════════════════════════════
+    summary_df = pd.DataFrame()
+    try:
+        if _has_secrets:
+            conn   = st.connection("gsheets", type=_GSheetsConnection)
+            df_all = conn.read(
+                spreadsheet=f"https://docs.google.com/spreadsheets/d/{_CRM_SHEET_ID}",
+                worksheet=_ws,
+                ttl=_CRM_CACHE_TTL,
+            )
+            if df_all is not None and not df_all.empty:
+                df_raw = df_all.reset_index(drop=True)
+            else:
+                df_raw = pd.DataFrame()
+        else:
+            csv_url = (
+                f"https://docs.google.com/spreadsheets/d/{_CRM_SHEET_ID}"
+                f"/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(_ws)}"
+            )
+            df_raw = pd.read_csv(csv_url, header=None, dtype=str)
+
+        if df_raw is not None and not df_raw.empty:
+            # STEP 1: iloc[14:32] = 엑셀 15~32행
+            df_raw = df_raw.iloc[_CRM_SUM_ROW_START:_CRM_SUM_ROW_END].reset_index(drop=True)
+
+            n_cols = df_raw.shape[1]
+            if not df_raw.empty and n_cols > _CRM_SUM_COL_STAFF:
+                # STEP 2: B열 필터
+                _b_col = df_raw.iloc[:, _CRM_SUM_COL_STAFF].astype(str).str.strip()
+                _skip_b = {"", "nan", "None", "직원명", "합계", "합 계"}
+                df_raw = df_raw[~_b_col.isin(_skip_b)].reset_index(drop=True)
+
+                if not df_raw.empty:
+                    col_map = {
+                        "지사":       _CRM_SUM_COL_BRANCH,
+                        "직원명":     _CRM_SUM_COL_STAFF,
+                        "방문_CRM":   _CRM_SUM_COL_VISIT,
+                        "비대면_CRM": _CRM_SUM_COL_ONLINE,
+                        "전화_CRM":   _CRM_SUM_COL_PHONE,
+                    }
+                    valid = {k: v for k, v in col_map.items() if v < n_cols}
+                    if "직원명" in valid:
+                        sub = df_raw.iloc[:, list(valid.values())].copy()
+                        sub.columns = list(valid.keys())
+
+                        if "지사" not in sub.columns:
+                            sub["지사"] = ""
+
+                        sub["지사"] = sub["지사"].astype(str).str.strip()
+                        sub["지사"] = sub["지사"].replace({"nan": "", "None": ""})
+                        sub["지사"] = sub["지사"].replace("", np.nan).ffill().fillna("")
+
+                        sub["직원명"] = sub["직원명"].astype(str).str.strip()
+                        _skip_names = {"", "nan", "None", "직원명", "상담직원", "합계", "합 계", "이름", "성명"}
+                        sub = sub[~sub["직원명"].isin(_skip_names)].copy()
+                        sub = sub[sub["직원명"].str.len() >= 2].copy()
+
+                        for col in ["방문_CRM", "비대면_CRM", "전화_CRM"]:
+                            if col in sub.columns:
+                                sub[col] = pd.to_numeric(sub[col], errors="coerce").fillna(0.0)
+                            else:
+                                sub[col] = 0.0
+
+                        sub = sub[(sub["방문_CRM"] + sub["비대면_CRM"] + sub["전화_CRM"]) > 0].copy()
+                        sub["직원명_key"] = sub["직원명"].apply(_norm_key)
+
+                        sub = sub.reset_index(drop=True)
+                        sub["_row_order"] = sub.index
+                        sub = (
+                            sub.groupby(["지사", "직원명_key"], sort=False, as_index=False)
+                            .agg(_row_order=("_row_order", "min"),
+                                 직원명=("직원명", "first"),
+                                 방문_CRM=("방문_CRM", "sum"),
+                                 비대면_CRM=("비대면_CRM", "sum"),
+                                 전화_CRM=("전화_CRM", "sum"))
+                            .sort_values("_row_order")
+                            .drop(columns=["_row_order"])
+                            .reset_index(drop=True)
+                        )
+                        summary_df = sub
+    except Exception:
+        pass
+
+    return summary_df
+
+
+@st.cache_data(ttl=_CRM_CACHE_TTL)
+def load_crm_detailed_matching_data(sheet_id: str = _CRM_SHEET_ID) -> pd.DataFrame:
+    """
+    매출 전환 분석 전용 — 지사별 탭(강남~부산)에서 4개 열만 추출합니다.
+    통합 시트(Q/W/AC열)와 완전히 분리된 별도 로직입니다.
+
+      F열(5):   가입자명  → 팀블로 상담자명과 매칭
+      X열(23):  상담직원  → 팀블로 상담직원명과 매칭
+      Y열(24):  상담방식  → 분석 보조 정보
+      AI열(34): 구입여부  → '구입' 여부 판별 (_PURCHASE_KEYWORD)
+
+    날짜 필터 없이 전체 행을 읽어 merge_timblo_crm()에 바로 넘길 수 있는 DataFrame으로 반환합니다.
+    반환 열: 가입자명, 상담직원, 상담방식_crm, 구입여부, 지사_crm,
+             가입자명_key, 상담직원_key, 상담날짜_str(빈값), 구입날짜(빈값)
+    """
+    import urllib.parse
+
+    _has_secrets = False
+    if _GSHEETS_OK:
+        try:
+            _has_secrets = bool(st.secrets.get("connections", {}).get("gsheets"))
+        except Exception:
+            pass
+
+    frames: list[pd.DataFrame] = []
+    for branch in _CRM_BRANCHES:
+        try:
+            if _has_secrets:
+                conn   = st.connection("gsheets", type=_GSheetsConnection)
+                df_raw = conn.read(
+                    spreadsheet=f"https://docs.google.com/spreadsheets/d/{sheet_id}",
+                    worksheet=branch,
+                    ttl=_CRM_CACHE_TTL,
+                )
+            else:
+                csv_url = (
+                    f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+                    f"/gviz/tq?tqx=out:csv&sheet={urllib.parse.quote(branch)}"
+                )
+                df_raw = pd.read_csv(csv_url, header=0, dtype=str)
+
+            if df_raw is None or df_raw.empty:
+                continue
+
+            n = df_raw.shape[1]
+            # ── 지사별 시트 전용 열 인덱스 (통합 시트 Q/W/AC 와 완전히 다름) ──
+            col_map = {
+                "가입자명":     _CRM_COL_CUSTOMER,  # F열(5)
+                "상담직원":     _CRM_COL_STAFF,      # X열(23)
+                "상담방식_crm": _CRM_COL_MODE,       # Y열(24)
+                "구입여부":     _CRM_COL_PURCHASE,   # AI열(34)
+            }
+            valid = {k: v for k, v in col_map.items() if v < n}
+            if "가입자명" not in valid:
+                continue
+
+            sub = df_raw.iloc[:, list(valid.values())].copy()
+            sub.columns = list(valid.keys())
+            sub["지사_crm"] = branch
+
+            sub["가입자명"] = sub["가입자명"].astype(str).str.strip()
+            sub = sub[~sub["가입자명"].isin(["", "nan", "None"])].copy()
+            if sub.empty:
+                continue
+
+            frames.append(sub)
+        except Exception:
+            pass
+
+    if not frames:
+        return pd.DataFrame()
+
+    detail = pd.concat(frames, ignore_index=True)
+    detail["가입자명_key"]  = detail["가입자명"].apply(_norm_key)
+    detail["상담직원_key"]  = detail["상담직원"].astype(str).apply(_norm_key) if "상담직원" in detail.columns else ""
+    if "구입여부" not in detail.columns:
+        detail["구입여부"] = ""
+    # merge_timblo_crm이 참조하는 열 — 없으면 빈값으로 채움
+    detail["상담날짜_str"] = ""
+    detail["구입날짜"]     = ""
+    return detail
 
 
 def merge_timblo_crm(records: list, crm_df: pd.DataFrame) -> pd.DataFrame:
@@ -483,25 +732,42 @@ def merge_timblo_crm(records: list, crm_df: pd.DataFrame) -> pd.DataFrame:
     if crm_df.empty or not records:
         return pd.DataFrame(records)
 
-    def _mk(s: str) -> str:
-        return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s or "")).strip()
-
     rows = []
     for r in records:
         p          = parse_title(r.get("title", ""))
-        client_key = _mk(p.get("client", ""))
-        staff_key  = _mk(p.get("staff",  ""))
+        client_key = _norm_key(p.get("client", ""))
+        staff_key  = _norm_key(p.get("staff",  ""))
         row        = dict(r)
 
-        # 매칭 시도: 고객명 + 직원명 동시 일치 우선, 고객명만도 허용
+        # ── 매칭 4단계: 정확도 내림차순 ────────────────────────────────
+        branch_val = (p.get("branch", "") or "").strip()
+        client_kr  = _pure_korean(client_key)  # 순수 한글만 (fallback용)
+
         matched = pd.DataFrame()
-        if client_key and staff_key:
+        # Level-1: 지사 + 직원 + 고객명 3중 정확 매칭
+        if branch_val and client_key and staff_key and "지사_crm" in crm_df.columns:
+            matched = crm_df[
+                (crm_df["지사_crm"]       == branch_val) &
+                (crm_df["상담직원_key"]   == staff_key)  &
+                (crm_df["가입자명_key"]   == client_key)
+            ]
+        # Level-2: 직원 + 고객명 정확 매칭
+        if matched.empty and client_key and staff_key:
             matched = crm_df[
                 (crm_df["가입자명_key"] == client_key) &
                 (crm_df["상담직원_key"] == staff_key)
             ]
+        # Level-3: 고객명 정확 매칭
         if matched.empty and client_key:
             matched = crm_df[crm_df["가입자명_key"] == client_key]
+        # Level-4: 순수 한글 포함 매칭 (공백·특수문자 차이 흡수)
+        if matched.empty and client_kr:
+            matched = crm_df[
+                crm_df["가입자명_key"].apply(
+                    lambda v: (lambda k: bool(k and (client_kr in k or k in client_kr)))
+                    (_pure_korean(v))
+                )
+            ]
 
         if not matched.empty:
             m = matched.iloc[0]
@@ -533,20 +799,33 @@ def get_env_config() -> dict:
         # 1순위: Streamlit Cloud secrets
         try:
             v = st.secrets.get(key)
-            if v: return str(v).strip()
+            if v:
+                # 따옴표·개행·공백 전부 제거 (secrets.toml 입력 실수 방어)
+                v = str(v).strip().strip('"').strip("'").strip()
+                if v:
+                    return v
         except Exception:
             pass
         # 2순위: 환경변수 / .env 파일 (dotenv로 이미 로드됨)
-        v = os.getenv(key, "").strip()
+        v = os.getenv(key, "").strip().strip('"').strip("'").strip()
         return v if v else fallback
 
-    return {
+    cfg = {
         "api_base":   _s("TIMBLO_API_BASE",  "https://demo.timblo.io/api"),
         "api_key":    _s("TIMBLO_API_KEY",    "cm8o8cqet000014gd7ig5cxrw"),
         "email":      _s("TIMBLO_EMAIL",      "sorizava_counsel@timbel.net"),
         "gemini_key": _s("GEMINI_API_KEY"),
         "openai_key": _s("OPENAI_API_KEY"),
     }
+    # 키 로드 결과를 터미널에 출력 (앞 8자만 — 디버깅용)
+    _gk = cfg["gemini_key"]
+    _ok = cfg["openai_key"]
+    print(
+        f"[ENV] gemini_key={'설정됨('+_gk[:8]+')' if _gk else '없음'}  "
+        f"openai_key={'설정됨('+_ok[:8]+')' if _ok else '없음'}",
+        flush=True,
+    )
+    return cfg
 
 def is_timblo_ready(cfg): return bool(cfg["api_base"] and cfg["api_key"] and cfg["email"])
 def is_gemini_ready(cfg): return bool(cfg.get("gemini_key"))
@@ -617,10 +896,21 @@ def fmt_date(raw):
 
 
 def calc_total_score(quality_scores: dict, rubric: list = None) -> float:
+    """소수점 0.1 단위 정밀 채점 — AI가 반환한 배점 내 소수점 점수를 그대로 환산."""
     if not quality_scores: return 0.0
+    def _to_float(v, default=3.0):
+        try: return float(v)
+        except (TypeError, ValueError): return default
     if rubric:
-        return round(sum((quality_scores.get(r["항목"], 3) / 5) * r["배점"] for r in rubric), 1)
-    return round(sum((quality_scores.get(k, 3) / 5) * w for k, w in QUALITY_WEIGHTS.items()), 1)
+        total = sum(
+            (_to_float(quality_scores.get(r["항목"], 3.0)) / 5.0) * r["배점"]
+            for r in rubric
+        )
+        return round(total, 1)
+    return round(
+        sum((_to_float(quality_scores.get(k, 3.0)) / 5.0) * w for k, w in QUALITY_WEIGHTS.items()),
+        1
+    )
 
 
 def score_grade(score: float) -> str:
@@ -656,6 +946,7 @@ MANDATORY_KEYWORD_MAP: dict = {
         "웍스파이", "워크스파이", "워크스", "웍스", "Worksfy", "worksfy",
         "일감 플랫폼", "일감플랫폼", "일거리 사이트", "일거리사이트",
         "플랫폼", "프리랜서 플랫폼", "협회 플랫폼",
+        "워크", "수요", "일거리", "실제 수요", "실제수요",
     ],
     # 가격 인상 예정 고지
     "가격 인상": [
@@ -663,6 +954,7 @@ MANDATORY_KEYWORD_MAP: dict = {
         "장비값 오른", "팀벨 인상", "팀벨인상", "인상 예정", "인상예정",
         "오를 예정", "오르기 전", "가격이 오", "비용 인상", "비용인상",
         "가격 올", "금액 올",
+        "인상", "오를", "변동", "금액", "오르기", "팀벨", "가격이",
     ],
     # 구매 적기 어필
     "구매 적기": [
@@ -670,6 +962,7 @@ MANDATORY_KEYWORD_MAP: dict = {
         "난이도 하향", "취득 적기", "적기", "지금이 최적기",
         "지금 시작", "이번 달", "한시적", "지금이 기회",
         "기회", "지금 아니면",
+        "10분", "최적", "수정 시간", "지금",
     ],
 }
 
@@ -807,7 +1100,7 @@ def build_analysis_prompts(conversation_text: str, speech_stats: dict, title_met
         for r in rubric
     ]
     q_block  = "\n".join(q_lines)
-    q_schema = ", ".join(f'"{r["항목"]}": 3' for r in rubric)
+    q_schema = ", ".join(f'"{r["항목"]}": 3.0' for r in rubric)  # float 힌트
 
     # 흐름 단계 목록
     flow_list   = ", ".join(u_flow_stages)
@@ -883,19 +1176,37 @@ def build_analysis_prompts(conversation_text: str, speech_stats: dict, title_met
     system_text = f"""{persona_line}
 반드시 JSON 형식으로만 응답하세요. JSON 외 텍스트·마크다운 절대 금지.
 
-## 채점표 (총 배점 {total_max}점 / 각 항목 1~5점)
+## 채점표 (총 배점 {total_max}점)
 {rubric_block}
 
-## 채점 원칙 (엄격·객관 기준)
-- 5점: 세부 기준 완전 충족 + 구체적 언급·실행 확인
-- 4점: 대부분 충족, 일부 세부 요소 누락
-- 3점: 핵심만 언급, 구체성·깊이 부족
-- 2점: 형식적·피상적 언급에 그침
-- 1점: 해당 항목 미수행 또는 완전 누락
-- 점수 편중 금지: 3점(중간값)에만 집중하지 말고 1~5 전 구간 활용
+## 채점 원칙 ★★ 0.1점 단위 정밀 채점 필수 ★★
+- 각 항목 점수는 0.0 ~ 5.0 범위의 소수점 한 자리 실수(float)로 반환할 것.
+  예: 1.0 / 1.5 / 2.3 / 3.7 / 4.5 / 5.0
+- 최종 점수 = (항목 점수 / 5.0) × 배점  →  배점 내에서 0.1점 단위로 세밀하게 분배
+- 점수 기준 (기준 내에서 소수점 세분화 필수)
+  · 5.0점: 세부 기준 완전 충족 + 구체적 언급·실행 확인
+  · 4.0~4.9점: 대부분 충족, 세부 요소 일부 누락
+  · 3.0~3.9점: 핵심만 언급, 구체성·깊이 부족
+  · 2.0~2.9점: 언급은 있으나 피상적·짧음 (예: 2.0점 항목에서 간략 언급 → 0.8점 환산)
+  · 1.0~1.9점: 매우 형식적, 핵심 메시지 전달 실패
+  · 0.0~0.9점: 해당 항목 미수행 또는 완전 누락
+
+## 발화 통계 기반 채점 원칙
+- 화자별 발화 통계가 제공된다. talk_ratio와 total_chars를 채점에 반드시 반영할 것.
+- 상담사 발화 비중(talk_ratio)이 높고 핵심 키워드가 포함된 항목 → 개선점 제외, 고득점(4.0~5.0) 부여
+- 상담사 발화량이 적은 항목은 설명 충실도를 근거로 감점 가능
+
+## 감점·미준수 판단 시 실제 발화 인용 의무
+- 점수를 3.5 미만으로 부여하거나 개선점을 도출할 때는 반드시:
+  · 어느 발화에서 부족함이 확인됐는지 대화 원문의 한 문장 이상을 직접 인용
+  · improvements 항목 형식: "개선 필요 내용 — 근거: '실제 발화 인용'"
+- 근거 없는 추상적 개선점(예: "경청이 부족합니다") 출력 금지
+
+## 기타 원칙
+- 점수 편중 금지: 특정 구간(3점대)에 집중하지 말고 0.0~5.0 전 구간 활용
 - STT 오타 허용: 유사 발음·구어체를 정상 언급으로 인정
 - 키워드 가점: 웍스파이/워크스, 가격 인상/팀벨 인상, 2026년/수정 시간 10분 등
-  핵심 키워드 명시 언급 → 해당 항목 최소 4점 보장
+  핵심 키워드 명시 언급 → 해당 항목 최소 4.0점 보장
 - 짧아도 핵심 전달 시 고점 가능
 {mand_instruction}"""
 
@@ -903,19 +1214,21 @@ def build_analysis_prompts(conversation_text: str, speech_stats: dict, title_met
     user_text = f"""[상담 메타정보]
 {meta_block}
 
-[화자별 발화 통계]
+[화자별 발화 통계 — 채점 시 반드시 참조]
 {stats_block}
+※ talk_ratio가 높은 화자가 해당 항목 키워드를 충분히 언급했다면 개선점 제외 + 고득점 부여
 
 [전체 대화 내용]
 {conversation_text}
 
 [분석 지시 — 아래 항목 전부 분석 → 단일 JSON 반환]
 1. 역할 판별: 발화 성격(설명/질문/고민)으로 상담원/고객 구분
-2. 품질 점수 (각 항목 1~5점, system 채점 원칙 必 적용):
+2. 품질 점수 ★ 반드시 0.0~5.0 소수점 한 자리 float으로 반환 ★ (system 채점 원칙 必 적용):
 {q_block}
+   ※ 감점(3.5 미만) 시 해당 발화 인용 필수
 3. 흐름 단계 포함 여부 (true/false): {flow_list}
-4. 강점 3가지 (실제 대화 근거 기반 한 문장씩)
-5. 개선점 3가지 (경청 문제 포함)
+4. 강점 3가지 (실제 대화 근거 기반 한 문장씩, 발화 직접 인용 포함)
+5. 개선점 3가지 — 형식: "개선 내용 — 근거: '실제 발화 인용'" (추상적 나열 금지)
 6. 고객 발화 TOP 20 키워드, 상담사 발화 TOP 20 키워드 (의미있는 명사/동사)
 7. 질문 패턴 횟수: 공부기간, 시험난이도, 수익가능성, 가격, 취업가능성, 기타
 8. 감정 분석: 긍정/중립/부정 비율 (합계 1.0)
@@ -1024,10 +1337,26 @@ def fetch_transcript(client, content_id: str, title_meta: dict) -> dict:
 # 에러 분류 + JSON 파싱
 # ══════════════════════════════════════════════════════════
 def classify_error(e: Exception) -> str:
-    msg = str(e).lower()
+    msg       = str(e).lower()
+    etype_cls = type(e).__name__.lower()   # 예: "authenticationerror", "permissiondeniederror"
     if "empty_data" in str(e) or "텍스트 없음" in str(e): return "EMPTY_DATA"
     if "rate" in msg or "quota" in msg or "429" in msg or "resource_exhausted" in msg: return "RATE_LIMIT"
-    if "api_key" in msg or "invalid_argument" in msg or "401" in msg or "403" in msg: return "AUTH"
+    # AUTH: HTTP 401/403, OpenAI AuthenticationError, Gemini API_KEY_INVALID / PERMISSION_DENIED
+    # ※ "invalid_argument" 제거 — JSON 파라미터 오류 등 비인증 오류가 AUTH로 오분류되던 문제 수정
+    # ※ "[auth]" in msg — 이미 래핑된 RuntimeError에서도 AUTH 타입 보존
+    _auth_signals = (
+        "401" in msg or "403" in msg
+        or "[auth]" in msg                     # 이미 래핑된 AUTH RuntimeError 재인식
+        or "incorrect api key" in msg          # OpenAI: Incorrect API key provided
+        or "no api key" in msg                 # OpenAI: No API key provided
+        or "invalid_api_key" in msg            # OpenAI error code
+        or "api_key_invalid" in msg            # Gemini
+        or "permission_denied" in msg          # Gemini gRPC
+        or "unauthenticated" in msg            # gRPC status
+        or "authentication" in etype_cls       # openai.AuthenticationError
+        or ("permission" in etype_cls and "denied" in msg)
+    )
+    if _auth_signals: return "AUTH"
     if "404" in msg or "not found" in msg: return "MODEL_NOT_FOUND"
     if "json" in msg: return "JSON_PARSE"
     if "connection" in msg or "timeout" in msg: return "NETWORK"
@@ -1091,8 +1420,11 @@ def build_record(content_id, title, start_time, result, speech_stats, segment_co
 # ══════════════════════════════════════════════════════════
 def run_gemini_analysis(client, content_id, title, start_time, title_meta, gemini_api_key) -> dict:
     import google.generativeai as genai
+    _clean_gkey = (gemini_api_key or "").strip().strip('"').strip("'").strip()
+    if not _clean_gkey:
+        raise RuntimeError("[AUTH] Gemini API 키가 비어 있습니다. .env 또는 Secrets에 GEMINI_API_KEY를 입력하세요.")
     cached = fetch_transcript(client, content_id, title_meta)
-    genai.configure(api_key=gemini_api_key)
+    genai.configure(api_key=_clean_gkey)
     try:
         model = genai.GenerativeModel(
             "gemini-2.0-flash",
@@ -1117,8 +1449,12 @@ def run_gemini_analysis(client, content_id, title, start_time, title_meta, gemin
 def run_openai_analysis(client, content_id, title, start_time, title_meta,
                         openai_api_key, model_id: str = "gpt-4o-mini") -> dict:
     from openai import OpenAI as _OpenAI
+    _clean_okey = (openai_api_key or "").strip().strip('"').strip("'").strip()
+    if not _clean_okey:
+        raise RuntimeError("[AUTH] OpenAI API 키가 비어 있습니다. .env 또는 Secrets에 OPENAI_API_KEY를 입력하세요.")
+    # sk-proj-… 형식도 유효 — startswith("sk-") 체크 제거
     cached = fetch_transcript(client, content_id, title_meta)
-    oa = _OpenAI(api_key=openai_api_key)
+    oa = _OpenAI(api_key=_clean_okey)
     try:
         resp = oa.chat.completions.create(
             model=model_id,
@@ -1147,26 +1483,48 @@ def run_openai_analysis(client, content_id, title, start_time, title_meta,
 def run_hybrid_analysis(client, content_id, title, start_time, title_meta, cfg) -> dict:
     gemini_key = cfg.get("gemini_key")
     openai_key = cfg.get("openai_key")
-    # 선택된 AI 모델 (고성능 모드 지원)
-    sel_model  = st.session_state.get("ai_model", "gpt-4o-mini")
+
+    # ── 키 없음 → 즉시 AUTH 오류 (재시도 없음) ──
+    if not gemini_key and not openai_key:
+        raise RuntimeError(
+            "[AUTH] API 키가 설정되지 않았습니다. "
+            ".env 파일 또는 Streamlit Secrets에 GEMINI_API_KEY / OPENAI_API_KEY를 입력하세요."
+        )
+
+    sel_model = st.session_state.get("ai_model", "gpt-4o-mini")
 
     if gemini_key and sel_model == "gemini":
         try:
             return run_gemini_analysis(client, content_id, title, start_time, title_meta, gemini_key)
         except RuntimeError as e:
-            if classify_error(e) == "RATE_LIMIT" and openai_key:
+            etype = classify_error(e)
+            if etype == "AUTH":
+                # 인증 오류 → 즉시 전파, OpenAI 폴백 없음
+                raise RuntimeError(
+                    f"[AUTH] Gemini 인증 실패 — API 키를 확인하세요. 원본: {e}"
+                ) from e
+            if etype == "RATE_LIMIT" and openai_key:
                 safe = str(e).encode("ascii", errors="replace").decode("ascii")
                 print(f"[FALLBACK] Gemini 한도 -> ChatGPT: {safe}", flush=True)
-            elif not openai_key:
-                raise
+                # fall-through to openai block below
             else:
                 raise
+
     if openai_key:
-        return run_openai_analysis(client, content_id, title, start_time, title_meta,
-                                   openai_key, model_id=sel_model if sel_model != "gemini" else "gpt-4o-mini")
+        # RuntimeError는 run_openai_analysis 내에서 이미 [TYPE] 접두사로 래핑됨 → 그대로 전파
+        return run_openai_analysis(
+            client, content_id, title, start_time, title_meta,
+            openai_key,
+            model_id=sel_model if sel_model != "gemini" else "gpt-4o-mini",
+        )
+
     if gemini_key:
         return run_gemini_analysis(client, content_id, title, start_time, title_meta, gemini_key)
-    raise RuntimeError("Gemini와 OpenAI 키가 모두 없습니다.")
+
+    raise RuntimeError(
+        "[AUTH] 사용 가능한 AI 키가 없습니다. "
+        "사이드바에서 API 키 설정을 확인하세요."
+    )
 
 
 # ══════════════════════════════════════════════════════════
@@ -1411,10 +1769,17 @@ if st.session_state.auto_queue and client and (is_gemini_ready(cfg) or is_openai
                 "cid": cid, "title": title, "error_type": etype,
                 "error_msg": str(e), "time": datetime.now().strftime("%H:%M:%S"),
             })
-            if etype == "RATE_LIMIT":
+            if etype == "AUTH":
+                # 인증 오류 → 해당 항목만 실패 기록, 큐는 계속 진행 (큐 전체 중단 금지)
+                # 사이드바에 마지막 AUTH 오류 메시지만 보관
+                st.session_state["_auth_error_msg"] = str(e)
+                print(f"[AUTO] AUTH 오류 — 해당 항목 스킵, 다음 항목 계속", flush=True)
+            elif etype == "RATE_LIMIT":
                 time.sleep(st.session_state.auto_delay + 10)
 
-    st.session_state.auto_queue.pop(0)
+    # pop 시 IndexError 방지 (이미 다른 경로로 큐가 비워진 경우 대비)
+    if st.session_state.auto_queue:
+        st.session_state.auto_queue.pop(0)
     if st.session_state.auto_queue:
         time.sleep(st.session_state.auto_delay)
     st.rerun()
@@ -1442,6 +1807,16 @@ with st.sidebar:
         st.success(f"AI: {' + '.join(ai_list)}")
     else:
         st.error("AI 키 미설정")
+        st.caption("GEMINI_API_KEY 또는 OPENAI_API_KEY를 .env 파일에 입력하세요.")
+
+    # AUTH 오류 발생 시 사이드바 경고 표시
+    _auth_err = st.session_state.get("_auth_error_msg", "")
+    if _auth_err:
+        st.error(f"🔐 인증 오류 — 자동 분석 중단됨")
+        st.caption(_auth_err[:120])
+        if st.button("오류 닫기", key="btn_clear_auth_err", use_container_width=True):
+            st.session_state["_auth_error_msg"] = ""
+            st.rerun()
 
     st.markdown("---")
     st.markdown("**데이터 필터**")
@@ -1500,6 +1875,22 @@ with st.sidebar:
     else:
         date_range = None
         st.caption("날짜 정보 없음")
+
+    st.markdown("---")
+    if st.button("🔄 CRM 데이터 갱신", use_container_width=True,
+                 help="구글 시트를 즉시 다시 읽어옵니다 (CRM 캐시만 삭제)"):
+        load_crm_data.clear()
+        load_crm_purchase_status.clear()
+        st.rerun()
+
+    if st.button("⚡ 시스템 전체 초기화", use_container_width=True, type="primary",
+                 help="모든 캐시·세션 변수를 비우고 통합 시트(요약)와 지사별 시트(결제상세)를 모두 새로 읽어옵니다"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        for _ss_key in list(st.session_state.keys()):
+            if any(k in _ss_key.lower() for k in ("crm", "구입", "purchase", "matched", "nurak")):
+                st.session_state[_ss_key] = None
+        st.rerun()
 
     st.markdown("---")
     st.markdown("**자동 분석**")
@@ -1628,11 +2019,58 @@ with tab_dash:
     records_all      = list(analyzed.values())
     records_filtered = apply_filters(records_all)
 
-    # ── CRM 데이터 최상단 로드 (분석 결과 유무 무관) ──
-    _crm_df = pd.DataFrame()
+    # ── CRM 데이터 최상단 로드 ──────────────────────────────────────────────
+    # load_crm_data()는 날짜 필터 없이 원시 데이터를 캐시 반환.
+    # '오늘' 기준 필터는 반드시 여기(매 렌더링)에서 실시간으로 적용.
+    _crm_df       = pd.DataFrame()   # 전체(오늘 이하) — merge_timblo_crm 등에 사용
+    _crm_month_df = pd.DataFrame()   # 당월 1일 ~ 오늘 — 직원표·누락KPI 전용
     _crm_load_error = ""
+    _crm_raw_n = 0
+    _crm_valid_n = 0
+
     try:
-        _crm_df = load_crm_data()
+        # cutoff_date를 오늘 날짜 문자열로 전달 → 날짜가 바뀌면 캐시 키 변경 → 자동 재로딩
+        _today_str = str(datetime.now().date())
+        _raw_crm   = load_crm_data(cutoff_date=_today_str)
+        _crm_raw_n = len(_raw_crm)
+
+        if not _raw_crm.empty:
+            _now_today      = pd.Timestamp(datetime.now().date())
+            _this_month_1st = _now_today.replace(day=1)
+
+            # ─ 날짜 열 보장 + timezone 정규화 (캐시 구버전·tz-aware 모두 방어)
+            _raw_crm = _raw_crm.copy()
+            if "상담날짜_dt" not in _raw_crm.columns:
+                _raw_crm["상담날짜_dt"] = pd.to_datetime(
+                    _raw_crm["상담날짜"].astype(str).str.strip()
+                    .str.replace(r"[./]", "-", regex=True)
+                    if "상담날짜" in _raw_crm.columns else pd.Series(dtype="object"),
+                    errors="coerce",
+                ).astype("datetime64[ns]")
+            # timezone-aware → naive 강제 변환
+            if _raw_crm["상담날짜_dt"].dt.tz is not None:
+                _raw_crm["상담날짜_dt"] = _raw_crm["상담날짜_dt"].dt.tz_localize(None)
+
+            # ① 전체(오늘 이하): 미래 예약 2차 완전 차단
+            _crm_df = _raw_crm[
+                _raw_crm["상담날짜_dt"].notna() &
+                (_raw_crm["상담날짜_dt"] <= _now_today)
+            ].copy()
+
+            # ② 당월(1일 ~ 오늘): 직원표·누락KPI 전용
+            _crm_month_df = _crm_df[
+                (_crm_df["상담날짜_dt"] >= _this_month_1st) &
+                (_crm_df["상담날짜_dt"] <= _now_today)
+            ].copy() if not _crm_df.empty else pd.DataFrame(columns=_crm_df.columns)
+
+        _crm_valid_n = len(_crm_df)
+
+        # ── 사이드바 디버그 캡션 ──
+        st.sidebar.caption(
+            f"📋 CRM: 전체 {_crm_raw_n}건 → 유효 {_crm_valid_n}건 "
+            f"(미래 예약 {_crm_raw_n - _crm_valid_n}건 제외) | "
+            f"당월 {len(_crm_month_df)}건"
+        )
     except Exception as _e:
         _crm_load_error = str(_e)
 
@@ -1661,8 +2099,71 @@ with tab_dash:
         st.info("좌측 **시작** 버튼으로 자동 분석을 시작하세요.")
 
     else:
-        # ── CRM 매칭 (분석 결과 있을 때만) ──
-        _merged_df   = merge_timblo_crm(records_filtered, _crm_df) if records_filtered and not _crm_df.empty else pd.DataFrame()
+        # ── CRM 요약 통계 로드 (직원별 현황 표 전용) ────────────────────────
+        _sheet_name = datetime.now().strftime("%Y-%m")
+        _crm_sum_df = load_crm_summary(sheet_name=_sheet_name)
+
+        # ── 지사별 상세 결제 데이터 로드 (매출 전환 분석 전용) ───────────────
+        _detail_crm_df = load_crm_detailed_matching_data()
+
+        # ── 상세 결제 데이터로 레코드별 구매 여부 판별 ──────────────────────
+        # {record_id: True(구입) / False(미구입)}
+        _purch_by_id: dict = {}
+        if not _detail_crm_df.empty:
+            _has_branch_col = "지사_crm" in _detail_crm_df.columns
+            for _r in records_filtered:
+                _p_     = parse_title(_r.get("title", ""))
+                _ck_    = _norm_key(_p_.get("client", ""))
+                _sk_    = _norm_key(_p_.get("staff",  ""))
+                _bk_    = (_p_.get("branch", "") or "").strip()
+                _ck_kr_ = _pure_korean(_ck_)
+                if not _ck_ and not _ck_kr_:
+                    continue
+
+                # Level-1: 지사 + 직원 + 고객명 3중 정확 매칭
+                _mask_ = (
+                    (_detail_crm_df["지사_crm"]     == _bk_) &
+                    (_detail_crm_df["상담직원_key"] == _sk_) &
+                    (_detail_crm_df["가입자명_key"] == _ck_)
+                ) if (_has_branch_col and _bk_ and _sk_ and _ck_) else pd.Series(False, index=_detail_crm_df.index)
+
+                # Level-2: 직원 + 고객명 정확 매칭
+                if not _mask_.any() and _ck_ and _sk_:
+                    _mask_ = (
+                        (_detail_crm_df["상담직원_key"] == _sk_) &
+                        (_detail_crm_df["가입자명_key"] == _ck_)
+                    )
+
+                # Level-3: 고객명 정확 매칭
+                if not _mask_.any() and _ck_:
+                    _mask_ = (_detail_crm_df["가입자명_key"] == _ck_)
+
+                # Level-4: 순수 한글 포함 매칭 (특수문자·공백 차이 흡수)
+                if not _mask_.any() and _ck_kr_:
+                    _mask_ = _detail_crm_df["가입자명_key"].apply(
+                        lambda v: (lambda k: bool(k and (
+                            _ck_kr_ in k or k in _ck_kr_
+                        )))(_pure_korean(v))
+                    )
+
+                if _mask_.any():
+                    _pval_ = str(_detail_crm_df.loc[_mask_, "구입여부"].iloc[0]).strip()
+                    _purch_by_id[_r.get("id")] = (_pval_ == _PURCHASE_KEYWORD)
+
+            # ── 매칭 0건 시 디버그 출력 ──────────────────────────────────────
+            if len(_purch_by_id) == 0 and records_filtered:
+                _dbg_timblo = [
+                    _norm_key(parse_title(_r.get("title", "")).get("client", ""))
+                    for _r in records_filtered[:5]
+                ]
+                _dbg_sheet = _detail_crm_df["가입자명_key"].dropna().head(5).tolist()
+                print(f"[CRM매칭 디버그] 팀블로 상담자명 예시(5): {_dbg_timblo}", flush=True)
+                print(f"[CRM매칭 디버그] 시트 가입자명 예시(5):  {_dbg_sheet}", flush=True)
+                print(f"[CRM매칭 디버그] 시트 전체 행 수: {len(_detail_crm_df)}", flush=True)
+
+        # ── CRM 매칭: 상세 결제 데이터 우선, 없으면 전체 CRM 데이터 사용 ──
+        _match_source = _detail_crm_df if not _detail_crm_df.empty else _crm_df
+        _merged_df   = merge_timblo_crm(records_filtered, _match_source) if records_filtered and not _match_source.empty else pd.DataFrame()
         _matched_df  = _merged_df[_merged_df.get("crm_matched", pd.Series(False, index=_merged_df.index)) == True].copy() if not _merged_df.empty and "crm_matched" in _merged_df.columns else pd.DataFrame()
 
         # ── 결제 상태 경량 동기화 (_CRM_CACHE_TTL 주기마다 AI열만 재조회) ──
@@ -1673,10 +2174,9 @@ with tab_dash:
         if not _matched_df.empty:
             try:
                 _purch_map = load_crm_purchase_status()
-                def _mk2(s): return re.sub(r"[\s\u00a0\u3000\u200b]+", "", str(s or "")).strip()
                 def _get_fresh_purch(row):
-                    ck = _mk2(row.get("client", ""))
-                    sk = _mk2(row.get("staff",  ""))
+                    ck = _norm_key(row.get("client", ""))
+                    sk = _norm_key(row.get("staff",  ""))
                     return _purch_map.get((ck, sk), row.get("crm_구입여부", ""))
                 _matched_df["crm_구입여부"] = _matched_df.apply(_get_fresh_purch, axis=1)
             except Exception:
@@ -1690,21 +2190,14 @@ with tab_dash:
             _crm_match_n   = len(_matched_df)
             _crm_conv_rate = round(_matched_df["결제성공"].sum() / max(_crm_match_n, 1) * 100, 1)
 
-        # 업로드 누락 인원 계산 (당월 기준 — 직원 고유 인원수)
+        # 업로드 누락 인원 계산 (당월 기준 — _crm_month_df 직접 사용)
         _nurak_alert_n = 0
-        if not _crm_df.empty and "상담직원_key" in _crm_df.columns:
+        if not _crm_month_df.empty and "상담직원_key" in _crm_month_df.columns:
             _kpi_today     = datetime.now().date()
-            _kpi_month_1st = _kpi_today.replace(day=1)
-            _kpi_month_str = _kpi_month_1st.strftime("%Y-%m-%d")
+            _kpi_month_str = _kpi_today.replace(day=1).strftime("%Y-%m-%d")
             _kpi_today_str = _kpi_today.strftime("%Y-%m-%d")
-            # CRM: 당월 데이터만
-            if "상담날짜_dt" in _crm_df.columns:
-                _crm_kpi = _crm_df[
-                    (_crm_df["상담날짜_dt"] >= pd.Timestamp(_kpi_month_1st)) &
-                    (_crm_df["상담날짜_dt"] <= pd.Timestamp(_kpi_today))
-                ]
-            else:
-                _crm_kpi = _crm_df
+            # _crm_month_df: 이미 당월 1일 ~ 오늘으로 필터링 완료
+            _crm_kpi = _crm_month_df
             # 팀블로: 당월 업로드만
             _timblo_src2 = st.session_state.get("content_list_all") or content_list or []
             _t2_rows = []
@@ -1714,7 +2207,7 @@ with tab_dash:
                     continue
                 _p2  = parse_title(_item2.get("editedTitle") or _item2.get("title", ""))
                 _br2 = _p2.get("branch", "") or "미확인"
-                _s2  = re.sub(r"\s+", "", _p2.get("staff", "") or "")
+                _s2  = _norm_key(_p2.get("staff", ""))
                 if _s2: _t2_rows.append({"지사": _br2, "직원명_key": _s2})
             _t2_cnt = (pd.DataFrame(_t2_rows).groupby(["지사","직원명_key"]).size().reset_index(name="업로드건수")
                        if _t2_rows else pd.DataFrame(columns=["지사","직원명_key","업로드건수"]))
@@ -1761,39 +2254,17 @@ with tab_dash:
         _emp_month_str = _emp_month_1st.strftime("%Y-%m-%d")
 
         st.subheader("📋 직원별 상담 업로드 현황")
+        _sheet_label = _sheet_name   # 이미 else 블록 상단에서 정의됨
         st.caption(
-            f"기준: {_emp_month_str} ~ {_emp_today_str} (당월) | "
-            "방문·비대면·전화 방식별 CRM vs 팀블로 비교 | 이번 달 업로드 직원만 표시 | 총 누락 5건↑ 빨간 하이라이트"
+            f"기준 시트: {_sheet_label} | CRM 합산 열(Q·W·AC) 직접 참조 | "
+            "직원명(X열) 기준 전체 표시 | 총 누락 5건↑ 빨간 하이라이트"
         )
 
-        if not _crm_df.empty and "상담방식_crm" in _crm_df.columns:
-            # ── CRM: 당월 데이터만 필터링
-            if "상담날짜_dt" in _crm_df.columns:
-                _crm_month = _crm_df[
-                    (_crm_df["상담날짜_dt"] >= pd.Timestamp(_emp_month_1st)) &
-                    (_crm_df["상담날짜_dt"] <= pd.Timestamp(_emp_today))
-                ].copy()
-            else:
-                _crm_month = _crm_df.copy()
-
-            # 직원 원본명 매핑
-            _emp_name_map = (
-                _crm_df.drop_duplicates("상담직원_key").set_index("상담직원_key")["상담직원"].to_dict()
-                if "상담직원" in _crm_df.columns else {}
-            )
-
-            # ── CRM 롱 테이블: 지사+직원+방식별
-            _emp_crm_long = (
-                _crm_month.groupby(["지사_crm", "상담직원_key", "상담방식_crm"])
-                .size().reset_index(name="cnt")
-                .rename(columns={"지사_crm": "지사", "상담직원_key": "직원명_key",
-                                  "상담방식_crm": "상담방식"})
-            )
-            _emp_crm_long["직원명"] = (
-                _emp_crm_long["직원명_key"].map(_emp_name_map).fillna(_emp_crm_long["직원명_key"])
-            )
-
-            # ── 팀블로: 당월 업로드 건수 롱 테이블
+        # _crm_sum_df 는 else 블록 상단 load_crm_summary() 호출에서 이미 로드됨
+        if _crm_sum_df.empty:
+            st.info("CRM 시트 연동 후 직원별 현황이 표시됩니다.")
+        else:
+            # ── ② 팀블로 당월 업로드 건수 (방식별)
             _timblo_emp_src = st.session_state.get("content_list_all") or content_list or []
             _emp_rows = []
             for _it in _timblo_emp_src:
@@ -1802,111 +2273,116 @@ with tab_dash:
                     continue
                 _pe   = parse_title(_it.get("editedTitle") or _it.get("title", ""))
                 _br_e = _pe.get("branch", "") or "미확인"
-                _st_e = re.sub(r"\s+", "", _pe.get("staff", "") or "")
+                _st_e = _norm_key(_pe.get("staff", ""))
                 _md_e = _pe.get("mode", "") or "기타"
                 if _st_e:
                     _emp_rows.append({"지사": _br_e, "직원명_key": _st_e, "상담방식": _md_e})
 
-            if not _emp_rows:
-                st.info("이번 달 업로드 내역이 없습니다.")
-            else:
+            if _emp_rows:
                 _emp_timblo_long = (
                     pd.DataFrame(_emp_rows)
                     .groupby(["지사", "직원명_key", "상담방식"]).size()
                     .reset_index(name="업로드건수")
                 )
-
-                # ── CRM 피벗 (방문/비대면/전화 열)
-                _crm_wide = _emp_crm_long.pivot_table(
-                    index=["지사", "직원명_key", "직원명"],
-                    columns="상담방식", values="cnt",
-                    aggfunc="sum", fill_value=0,
-                ).reset_index()
-                _crm_wide.columns.name = None
-                _crm_modes = [c for c in _crm_wide.columns if c not in ["지사","직원명_key","직원명"]]
-                _crm_wide  = _crm_wide.rename(columns={m: f"{m}_CRM" for m in _crm_modes})
-
-                # ── 팀블로 피벗 (방문/비대면/전화 열)
                 _up_wide = _emp_timblo_long.pivot_table(
                     index=["지사", "직원명_key"],
                     columns="상담방식", values="업로드건수",
                     aggfunc="sum", fill_value=0,
                 ).reset_index()
                 _up_wide.columns.name = None
-                _up_modes = [c for c in _up_wide.columns if c not in ["지사","직원명_key"]]
+                _up_modes = [c for c in _up_wide.columns if c not in ["지사", "직원명_key"]]
                 _up_wide  = _up_wide.rename(columns={m: f"{m}_업로드" for m in _up_modes})
+            else:
+                _up_wide = pd.DataFrame(columns=["지사", "직원명_key"])
 
-                # ── 피벗 병합
-                _emp_wide = _crm_wide.merge(_up_wide, on=["지사","직원명_key"], how="left").fillna(0)
+            # ── ③ CRM 합산 LEFT JOIN 팀블로 (CRM 직원은 업로드 0이어도 표시)
+            _emp_wide = _crm_sum_df.merge(_up_wide, on=["지사", "직원명_key"], how="left").fillna(0)
 
-                # 3가지 방식 컬럼 보장 (데이터 없는 방식도 0으로)
-                for _m in ["방문", "비대면", "전화"]:
-                    for _sfx in ["_CRM", "_업로드"]:
-                        if f"{_m}{_sfx}" not in _emp_wide.columns:
-                            _emp_wide[f"{_m}{_sfx}"] = 0
-                    _emp_wide[f"{_m}_CRM"]    = _emp_wide[f"{_m}_CRM"].astype(int)
-                    _emp_wide[f"{_m}_업로드"] = _emp_wide[f"{_m}_업로드"].astype(int)
+            # 3가지 방식 업로드 컬럼 보장
+            for _m in ["방문", "비대면", "전화"]:
+                if f"{_m}_업로드" not in _emp_wide.columns:
+                    _emp_wide[f"{_m}_업로드"] = 0
+                _emp_wide[f"{_m}_업로드"] = _emp_wide[f"{_m}_업로드"].astype(float)
 
-                # ── 총합 및 지표
-                _emp_wide["총_CRM"]      = _emp_wide["방문_CRM"]    + _emp_wide["비대면_CRM"]    + _emp_wide["전화_CRM"]
-                _emp_wide["총_업로드"]   = _emp_wide["방문_업로드"] + _emp_wide["비대면_업로드"] + _emp_wide["전화_업로드"]
-                _emp_wide["총_누락"]     = (_emp_wide["총_CRM"] - _emp_wide["총_업로드"]).clip(lower=0)
-                _emp_wide["업로드율(%)"] = (
-                    _emp_wide["총_업로드"] / _emp_wide["총_CRM"].replace(0, np.nan) * 100
-                ).round(1).fillna(0)
+            # CRM 건수도 float 통일
+            for _m in ["방문_CRM", "비대면_CRM", "전화_CRM"]:
+                _emp_wide[_m] = pd.to_numeric(_emp_wide[_m], errors="coerce").fillna(0)
 
-                # ── 이번 달 업로드 1건 이상 직원만 표시
-                _emp_wide = _emp_wide[_emp_wide["총_업로드"] > 0].copy()
+            # ── ④ 총합 및 지표
+            _emp_wide["총_CRM"]    = _emp_wide["방문_CRM"]    + _emp_wide["비대면_CRM"]    + _emp_wide["전화_CRM"]
+            _emp_wide["총_업로드"] = _emp_wide["방문_업로드"] + _emp_wide["비대면_업로드"] + _emp_wide["전화_업로드"]
+            _emp_wide["총_누락건수"] = (_emp_wide["총_CRM"] - _emp_wide["총_업로드"]).clip(lower=0)
+            _emp_wide["업로드율(%)"] = (
+                _emp_wide["총_업로드"] / _emp_wide["총_CRM"].replace(0, np.nan) * 100
+            ).round(1).fillna(0)
 
-                if _emp_wide.empty:
-                    st.info("이번 달 업로드 내역이 없습니다.")
-                else:
-                    _emp_wide = _emp_wide.sort_values(["총_누락","총_CRM"], ascending=[False, False])
+            # ── ⑤ 시트 원본 행 순서 보존 (load_crm_summary가 이미 정렬 완료)
 
-                    # 고유 인원 기준 경고 (총 누락 합계 >= 5인 직원 수)
-                    _emp_alert_n = int((_emp_wide["총_누락"] >= 5).sum())
-                    if _emp_alert_n:
-                        st.warning(f"⚠️ 총 누락 5건 이상 직원: **{_emp_alert_n}명** — 즉시 업로드 독촉 필요")
+            # ── ⑥ 지사명 병합 표현: 첫 행만 지사명, 나머지는 빈 문자열
+            _emp_wide = _emp_wide.reset_index(drop=True)
+            _emp_wide["지사_표시"] = _emp_wide["지사"].where(
+                ~_emp_wide["지사"].duplicated(), ""
+            )
 
-                    def _style_emp_wide(row):
-                        return (
-                            ["background-color: #fce8e8"] * len(row)
-                            if row["총_누락"] >= 5 else [""] * len(row)
-                        )
+            # ── ⑦ 합계 행 추가
+            _sum_row = {
+                "지사_표시": "합계",
+                "직원명":    "",
+                "방문_CRM":   _emp_wide["방문_CRM"].sum(),
+                "방문_업로드": _emp_wide["방문_업로드"].sum(),
+                "비대면_CRM":  _emp_wide["비대면_CRM"].sum(),
+                "비대면_업로드": _emp_wide["비대면_업로드"].sum(),
+                "전화_CRM":   _emp_wide["전화_CRM"].sum(),
+                "전화_업로드": _emp_wide["전화_업로드"].sum(),
+                "총_누락건수": _emp_wide["총_누락건수"].sum(),
+                "업로드율(%)": round(
+                    _emp_wide["총_업로드"].sum()
+                    / max(_emp_wide["총_CRM"].sum(), 1) * 100, 1
+                ),
+            }
+            _emp_final = pd.concat(
+                [_emp_wide, pd.DataFrame([_sum_row])], ignore_index=True
+            )
 
-                    _disp_cols = [
-                        "지사", "직원명",
-                        "방문_CRM", "방문_업로드",
-                        "비대면_CRM", "비대면_업로드",
-                        "전화_CRM", "전화_업로드",
-                        "총_누락", "업로드율(%)",
-                    ]
-                    _emp_final = (
-                        _emp_wide[[c for c in _disp_cols if c in _emp_wide.columns]]
-                        .reset_index(drop=True)
-                    )
-                    st.dataframe(
-                        _emp_final.style.apply(_style_emp_wide, axis=1),
-                        use_container_width=True, hide_index=True,
-                        column_config={
-                            "지사":         st.column_config.TextColumn("지사"),
-                            "직원명":       st.column_config.TextColumn("직원명"),
-                            "방문_CRM":     st.column_config.NumberColumn("방문 CRM",     format="%d건"),
-                            "방문_업로드":  st.column_config.NumberColumn("방문 업로드",  format="%d건"),
-                            "비대면_CRM":   st.column_config.NumberColumn("비대면 CRM",   format="%d건"),
-                            "비대면_업로드":st.column_config.NumberColumn("비대면 업로드",format="%d건"),
-                            "전화_CRM":     st.column_config.NumberColumn("전화 CRM",     format="%d건"),
-                            "전화_업로드":  st.column_config.NumberColumn("전화 업로드",  format="%d건"),
-                            "총_누락":      st.column_config.NumberColumn("총 누락",      format="%d건"),
-                            "업로드율(%)":  st.column_config.ProgressColumn(
-                                "업로드율", min_value=0, max_value=100, format="%.1f%%"
-                            ),
-                        },
-                    )
-        elif not _crm_df.empty:
-            st.info("CRM 시트에 상담방식(Y열) 데이터가 없어 방식별 비교가 불가합니다.")
-        else:
-            st.info("CRM 시트 연동 후 직원별 현황이 표시됩니다.")
+            # ── ⑧ 경고
+            _emp_alert_n = int((_emp_wide["총_누락건수"] >= 5).sum())
+            if _emp_alert_n:
+                st.warning(f"⚠️ 총 누락 5건 이상 직원: **{_emp_alert_n}명** — 즉시 업로드 독촉 필요")
+
+            def _style_emp_final(row):
+                if row.get("지사_표시") == "합계":
+                    return ["font-weight: bold; background-color: #f0f0f0"] * len(row)
+                return (
+                    ["background-color: #fce8e8"] * len(row)
+                    if row.get("총_누락건수", 0) >= 5 else [""] * len(row)
+                )
+
+            _disp_cols = [
+                "지사_표시", "직원명",
+                "방문_CRM", "방문_업로드",
+                "비대면_CRM", "비대면_업로드",
+                "전화_CRM", "전화_업로드",
+                "총_누락건수", "업로드율(%)",
+            ]
+            _show = _emp_final[[c for c in _disp_cols if c in _emp_final.columns]]
+            st.dataframe(
+                _show.style.apply(_style_emp_final, axis=1),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "지사_표시":     st.column_config.TextColumn("지사"),
+                    "직원명":        st.column_config.TextColumn("직원명"),
+                    "방문_CRM":      st.column_config.NumberColumn("방문 CRM",      format="%.1f건"),
+                    "방문_업로드":   st.column_config.NumberColumn("방문 업로드",   format="%.1f건"),
+                    "비대면_CRM":    st.column_config.NumberColumn("비대면 CRM",    format="%.1f건"),
+                    "비대면_업로드": st.column_config.NumberColumn("비대면 업로드", format="%.1f건"),
+                    "전화_CRM":      st.column_config.NumberColumn("전화 CRM",      format="%.1f건"),
+                    "전화_업로드":   st.column_config.NumberColumn("전화 업로드",   format="%.1f건"),
+                    "총_누락건수":   st.column_config.NumberColumn("총 누락 건수",  format="%.1f건"),
+                    "업로드율(%)":   st.column_config.ProgressColumn(
+                        "업로드율", min_value=0, max_value=100, format="%.1f%%"
+                    ),
+                },
+            )
 
         st.markdown("---")
 
@@ -2051,39 +2527,53 @@ with tab_dash:
             # ════════════════════════════════════════════
             st.subheader("💰 매출 전환 분석")
 
-            # ── 리드 점수 보유 레코드만 추출
-            _lead_recs = [r for r in records_filtered if r.get("lead_score", 0) > 0]
+            # ── _purch_by_id + _matched_df 통합 → 단일 전환 데이터 소스 ────────
+            # lead_score 유무에 관계없이 전체 records_filtered 대상
+            # 점수는 total_score(AI 채점) 우선, lead_score 폴백
+            _conv_data:    list = []  # [(record, score)]  전환 성공
+            _no_conv_data: list = []  # [(record, score)]  미전환(확인됨)
 
-            # ── CRM 매칭 데이터로 전환 여부 판단
-            _conv_lead_scores:     list = []   # 전환 성공 리드 점수
-            _no_conv_lead_scores:  list = []   # 미전환 리드 점수
+            _mid_set = set()  # _matched_df id 집합 (빠른 조회)
+            if not _matched_df.empty and "id" in _matched_df.columns:
+                _mid_set = set(_matched_df["id"].tolist())
 
-            if not _matched_df.empty and "crm_구입여부" in _matched_df.columns and _lead_recs:
-                _lead_id_map = {r["id"]: r.get("lead_score", 50) for r in _lead_recs}
-                for _, _mrow in _matched_df.iterrows():
-                    _ls = _lead_id_map.get(_mrow.get("id"))
-                    if _ls is None:
-                        continue
-                    if _is_purchased(_mrow.get("crm_구입여부", "")):
-                        _conv_lead_scores.append(_ls)
-                    else:
-                        _no_conv_lead_scores.append(_ls)
+            for _lr in records_filtered:
+                _lr_id  = _lr.get("id")
+                _lr_sc  = float(_lr.get("total_score") or _lr.get("lead_score") or 0)
+                _bought = _purch_by_id.get(_lr_id)
 
-            # ── KPI: 전환 성공 리드 평균 점수
-            _conv_avg_lead = round(sum(_conv_lead_scores) / len(_conv_lead_scores), 1) if _conv_lead_scores else None
-            _all_avg_lead  = round(sum(r.get("lead_score", 50) for r in _lead_recs) / max(len(_lead_recs), 1), 1) if _lead_recs else None
+                # _matched_df 로 보완
+                if _bought is None and _lr_id in _mid_set:
+                    _sl = _matched_df[_matched_df["id"] == _lr_id]
+                    if not _sl.empty and "crm_구입여부" in _sl.columns:
+                        _bought = _is_purchased(_sl.iloc[0]["crm_구입여부"])
+
+                if _bought is True:
+                    _conv_data.append((_lr, _lr_sc))
+                elif _bought is False:
+                    _no_conv_data.append((_lr, _lr_sc))
+
+            # ── KPI 계산 ─────────────────────────────────────────────────────
+            _conv_scores_all = [sc for _, sc in _conv_data if sc > 0]
+            _all_scores_all  = [sc for _, sc in (_conv_data + _no_conv_data) if sc > 0]
+            _conv_avg_lead   = round(sum(_conv_scores_all) / len(_conv_scores_all), 1) if _conv_scores_all else None
+            _all_avg_lead    = round(sum(_all_scores_all)  / len(_all_scores_all),  1) if _all_scores_all  else None
+            _conv_count      = len(_conv_data)
 
             _lcol1, _lcol2, _lcol3 = st.columns(3)
-            if _conv_avg_lead is not None:
-                _lcol1.metric("전환 성공 리드 평균 점수", f"{_conv_avg_lead}점",
-                              help="결제 완료된 상담의 고객 리드 점수 평균")
-            else:
-                _lcol1.metric("전환 성공 리드 평균 점수", "데이터 부족")
-            if _all_avg_lead is not None:
-                _lcol2.metric("전체 리드 평균 점수", f"{_all_avg_lead}점")
-            else:
-                _lcol2.metric("전체 리드 평균 점수", "분석 전")
-            _lcol3.metric("전환 성공 건수", f"{len(_conv_lead_scores)}건" if _conv_lead_scores else "CRM 매칭 필요")
+            _lcol1.metric(
+                "전환 성공 리드 평균 점수",
+                f"{_conv_avg_lead}점" if _conv_avg_lead is not None else "데이터 부족",
+                help="결제 완료 상담의 AI 채점 평균 (total_score 기준)",
+            )
+            _lcol2.metric(
+                "전체 리드 평균 점수",
+                f"{_all_avg_lead}점" if _all_avg_lead is not None else "분석 전",
+            )
+            _lcol3.metric(
+                "전환 성공 건수",
+                f"{_conv_count}건" if (_conv_data or _no_conv_data) else "CRM 매칭 필요",
+            )
 
             st.markdown("")
 
@@ -2092,21 +2582,24 @@ with tab_dash:
 
             with _col_lead_chart:
                 st.markdown("**📈 리드 점수 구간별 실제 결제 전환율**")
-                if _conv_lead_scores or _no_conv_lead_scores:
-                    _all_leads_with_conv = (
-                        [(s, True)  for s in _conv_lead_scores] +
-                        [(s, False) for s in _no_conv_lead_scores]
-                    )
-                    def _lead_band(score: int) -> str:
-                        b = (score // 10) * 10
+                # _conv_data + _no_conv_data: total_score 기준, lead_score 폴백
+                _all_scored = [
+                    (sc, True)  for _, sc in _conv_data    if sc > 0
+                ] + [
+                    (sc, False) for _, sc in _no_conv_data if sc > 0
+                ]
+                if _all_scored:
+                    def _lead_band(score: float) -> str:
+                        b = (int(score) // 10) * 10
                         return f"{b}~{b+9}점"
                     _band_order = [f"{b}~{b+9}점" for b in range(0, 100, 10)]
                     _lband_stats: dict = {b: {"total": 0, "conv": 0} for b in _band_order}
-                    for ls, conv in _all_leads_with_conv:
-                        b = _lead_band(ls)
+                    for sc, conv in _all_scored:
+                        b = _lead_band(sc)
                         if b in _lband_stats:
                             _lband_stats[b]["total"] += 1
-                            if conv: _lband_stats[b]["conv"] += 1
+                            if conv:
+                                _lband_stats[b]["conv"] += 1
                     _lband_df = pd.DataFrame([
                         {"점수구간": b,
                          "전체건수": v["total"],
@@ -2130,48 +2623,63 @@ with tab_dash:
                             marker=dict(size=8, color="#8e44ad"), name="추세선",
                         ))
                         fig_lead.update_layout(
-                            xaxis=dict(title="리드 점수 구간"),
+                            xaxis=dict(title="점수 구간 (total_score 기준)"),
                             yaxis=dict(title="전환율 (%)", range=[0, 110]),
                             legend=dict(orientation="h", y=-0.25),
                             margin=dict(t=20, b=60), height=340,
                         )
                         st.plotly_chart(fig_lead, use_container_width=True)
-                        st.caption(f"CRM 매칭 총 {len(_conv_lead_scores)+len(_no_conv_lead_scores)}건 기준")
+                        st.caption(f"CRM 매칭 총 {len(_all_scored)}건 기준 (전환성공 {len(_conv_data)}건)")
                     else:
                         st.caption("데이터가 부족합니다.")
                 else:
-                    st.info("CRM 매칭 + 리드 점수 분석 데이터가 필요합니다.")
+                    st.info("CRM 매칭 데이터가 필요합니다.")
 
             # ── 전환 성공 케이스 공통점 도출
             with _col_success:
                 st.markdown("**🏆 전환 성공 상담의 3가지 공통점**")
-                # 전환 성공 레코드 ID 집합
-                _conv_ids: set = set()
-                if not _matched_df.empty and "crm_구입여부" in _matched_df.columns:
-                    _conv_ids = set(
-                        _matched_df[_matched_df["crm_구입여부"].apply(_is_purchased)]["id"].tolist()
-                    )
-                _success_recs = [r for r in records_filtered if r.get("id") in _conv_ids]
+                # _conv_data 에서 직접 레코드 추출 (단일 소스)
+                _success_recs = [r for r, _ in _conv_data]
 
                 if _success_recs:
+                    def _iter_field(rec, key):
+                        """analyzed 레코드에서 리스트 필드를 안전하게 순회.
+                        값이 list → 그대로, str → 쉼표 분리, 기타 → 빈 iter."""
+                        val = rec.get(key)
+                        if isinstance(val, list):
+                            yield from (str(v).strip() for v in val if str(v).strip())
+                        elif isinstance(val, str) and val.strip() not in ("", "[]", "null"):
+                            import json as _json
+                            try:
+                                parsed = _json.loads(val)
+                                if isinstance(parsed, list):
+                                    yield from (str(v).strip() for v in parsed if str(v).strip())
+                                    return
+                            except Exception:
+                                pass
+                            for part in val.split(","):
+                                p = part.strip().strip('"').strip("'")
+                                if p:
+                                    yield p
+
                     # ① 공통 클로징 멘트 집계
                     _closing_cnt: dict = {}
                     for r in _success_recs:
-                        for ph in r.get("closing_phrases", []):
+                        for ph in _iter_field(r, "closing_phrases"):
                             _closing_cnt[ph] = _closing_cnt.get(ph, 0) + 1
                     _top_closing = sorted(_closing_cnt.items(), key=lambda x: x[1], reverse=True)[:3]
 
                     # ② 결심 직전 고객 발화 패턴
                     _decision_cnt: dict = {}
                     for r in _success_recs:
-                        for ds in r.get("decision_signals", []):
+                        for ds in _iter_field(r, "decision_signals"):
                             _decision_cnt[ds] = _decision_cnt.get(ds, 0) + 1
                     _top_decision = sorted(_decision_cnt.items(), key=lambda x: x[1], reverse=True)[:3]
 
                     # ③ 공통 강점 키워드
                     _str_cnt: dict = {}
                     for r in _success_recs:
-                        for s in r.get("strengths", []):
+                        for s in _iter_field(r, "strengths"):
                             _str_cnt[s] = _str_cnt.get(s, 0) + 1
                     _top_str = sorted(_str_cnt.items(), key=lambda x: x[1], reverse=True)[:3]
 
@@ -2417,51 +2925,224 @@ with tab_dash:
                 st.markdown("---")
 
             # ════════════════════════════════════════════
-            # AI 전략 인사이트
+            # AI 전략 인사이트 — 3가지 관점
             # ════════════════════════════════════════════
             st.subheader("💡 AI 전략 인사이트")
-            _excellent_recs = [r for r in records_filtered if r.get("total_score", 0) >= 85]
-            if not _excellent_recs:
-                st.info("우수 상담(85점 이상) 데이터가 아직 없습니다.")
-            else:
-                st.caption(f"우수 상담(85점 이상) {len(_excellent_recs)}건에서 추출한 핵심 패턴")
-                _succ_kw: dict = {}
-                for r in _excellent_recs:
-                    for kw in r.get("counselor_keywords", []):
-                        _succ_kw[kw] = _succ_kw.get(kw, 0) + 1
-                _top_kw = sorted(_succ_kw.items(), key=lambda x: x[1], reverse=True)[:12]
-                _phrases: list = []
-                for r in _excellent_recs:
-                    for s in r.get("strengths", []):
-                        if s and s not in _phrases: _phrases.append(s)
-                    if len(_phrases) >= 9: break
-                col_kw_s, col_phrases = st.columns([1, 2])
-                with col_kw_s:
-                    st.markdown("**🏅 핵심 성공 키워드**")
-                    if _top_kw:
-                        _kw_tags = " ".join(
+
+            # ── 공통 데이터 준비 ──
+            # 전환 성공 ID 집합: CRM 매칭 + 구입 확인된 레코드
+            _insight_success_ids: set = set()
+            _insight_fail_ids: set    = set()   # 리드 점수 높은데 미결제
+            if not _matched_df.empty and "crm_구입여부" in _matched_df.columns and "id" in _matched_df.columns:
+                _matched_df["결제성공_ins"] = _matched_df["crm_구입여부"].apply(_is_purchased)
+                _insight_success_ids = set(_matched_df[_matched_df["결제성공_ins"]]["id"].tolist())
+                _fail_mask = (~_matched_df["결제성공_ins"])
+                _insight_fail_ids = set(_matched_df[_fail_mask]["id"].tolist())
+
+            _ins_success_recs = [r for r in records_filtered if r.get("id") in _insight_success_ids]
+            # 전환 실패 중 리드 점수 60점 이상인 건만 (의미 있는 고관심 미전환)
+            _ins_fail_recs    = [r for r in records_filtered
+                                 if r.get("id") in _insight_fail_ids and r.get("lead_score", 0) >= 60]
+
+            ins_tab1, ins_tab2, ins_tab3 = st.tabs([
+                "🏆 결제 전환 성공 패턴",
+                "⚠️ 전환 실패 원인",
+                "📊 득점 격차 분석",
+            ])
+
+            # ── 탭 1: 결제 전환 성공 패턴 ──────────────────────────────────
+            with ins_tab1:
+                if not _ins_success_recs:
+                    st.info("CRM '구입' 확인 레코드가 없습니다. CRM 연동 후 재확인하세요.")
+                else:
+                    st.caption(f"CRM 구입 확인 {len(_ins_success_recs)}건에서 추출한 전환 성공 패턴")
+
+                    # 클로징 멘트 빈도
+                    _cph: dict = {}
+                    for r in _ins_success_recs:
+                        for ph in r.get("closing_phrases", []):
+                            if ph: _cph[ph] = _cph.get(ph, 0) + 1
+                    _top_cp = sorted(_cph.items(), key=lambda x: x[1], reverse=True)[:5]
+
+                    # 결심 직전 고객 신호 빈도
+                    _dsh: dict = {}
+                    for r in _ins_success_recs:
+                        for ds in r.get("decision_signals", []):
+                            if ds: _dsh[ds] = _dsh.get(ds, 0) + 1
+                    _top_ds = sorted(_dsh.items(), key=lambda x: x[1], reverse=True)[:5]
+
+                    # 핵심 설득 키워드
+                    _sckw: dict = {}
+                    for r in _ins_success_recs:
+                        for kw in r.get("counselor_keywords", []):
+                            _sckw[kw] = _sckw.get(kw, 0) + 1
+                    _top_sckw = sorted(_sckw.items(), key=lambda x: x[1], reverse=True)[:12]
+
+                    col_cp, col_ds = st.columns(2)
+                    with col_cp:
+                        st.markdown("**💬 핵심 클로징 멘트**")
+                        if _top_cp:
+                            for ph, cnt in _top_cp:
+                                st.markdown(
+                                    f'<div style="background:#f0fff4;border-left:4px solid #27ae60;'
+                                    f'border-radius:6px;padding:8px 14px;margin:5px 0;'
+                                    f'font-size:13px;line-height:1.5;">'
+                                    f'💬 {ph} <span style="color:#888;font-size:11px;">({cnt}건)</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.info("클로징 멘트 데이터 없음")
+                    with col_ds:
+                        st.markdown("**🎯 결심 직전 고객 신호**")
+                        if _top_ds:
+                            for ds, cnt in _top_ds:
+                                st.markdown(
+                                    f'<div style="background:#fff9e6;border-left:4px solid #f39c12;'
+                                    f'border-radius:6px;padding:8px 14px;margin:5px 0;'
+                                    f'font-size:13px;line-height:1.5;">'
+                                    f'🎯 {ds} <span style="color:#888;font-size:11px;">({cnt}건)</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.info("결심 신호 데이터 없음")
+
+                    st.markdown("**🔑 전환 성공 상담사 핵심 키워드**")
+                    if _top_sckw:
+                        _kw_html = " ".join(
                             f'<span style="background:#e8f4fd;border:1px solid #3498db;'
                             f'border-radius:14px;padding:4px 10px;margin:3px;'
                             f'display:inline-block;font-size:13px;color:#1a5276;">'
                             f'{"🔥" if cnt >= 3 else "✦"} {kw} <b>({cnt})</b></span>'
-                            for kw, cnt in _top_kw
+                            for kw, cnt in _top_sckw
                         )
-                        st.markdown(_kw_tags, unsafe_allow_html=True)
-                    else:
-                        st.info("키워드 데이터 부족")
-                with col_phrases:
-                    st.markdown("**💬 Golden Phrases — 설득 핵심 문장**")
-                    if _phrases:
-                        for i, phrase in enumerate(_phrases[:6]):
-                            _bg = "#fff9e6" if i % 2 == 0 else "#f0fff4"
-                            st.markdown(
-                                f'<div style="background:{_bg};border-left:4px solid #f39c12;'
-                                f'border-radius:6px;padding:8px 14px;margin:5px 0;'
-                                f'font-size:13.5px;line-height:1.5;">💬 {phrase}</div>',
-                                unsafe_allow_html=True,
+                        st.markdown(_kw_html, unsafe_allow_html=True)
+
+            # ── 탭 2: 전환 실패 원인 분석 ────────────────────────────────
+            with ins_tab2:
+                if not _ins_fail_recs:
+                    st.info("리드 점수 60점 이상 미전환 레코드가 없습니다.")
+                else:
+                    st.caption(
+                        f"리드 점수 60점↑ 미결제 {len(_ins_fail_recs)}건에서 추출한 망설임 포인트"
+                    )
+
+                    # 위험 신호 빈도
+                    _rsh: dict = {}
+                    for r in _ins_fail_recs:
+                        for rs in r.get("risk_signals", []):
+                            if rs: _rsh[rs] = _rsh.get(rs, 0) + 1
+                    _top_rs = sorted(_rsh.items(), key=lambda x: x[1], reverse=True)[:8]
+
+                    # 고객 주요 키워드 (망설임 관련)
+                    _fail_ckw: dict = {}
+                    for r in _ins_fail_recs:
+                        for kw in r.get("customer_keywords", []):
+                            _fail_ckw[kw] = _fail_ckw.get(kw, 0) + 1
+                    _top_fail_ckw = sorted(_fail_ckw.items(), key=lambda x: x[1], reverse=True)[:10]
+
+                    # 감정 부정 평균
+                    _neg_scores = [r.get("sentiment", {}).get("negative", 0) for r in _ins_fail_recs]
+                    _avg_neg = round(sum(_neg_scores) / max(len(_neg_scores), 1) * 100, 1)
+
+                    col_rs, col_fkw = st.columns(2)
+                    with col_rs:
+                        st.markdown("**⚠️ 결정적 망설임 신호 (위험 신호)**")
+                        if _top_rs:
+                            for rs, cnt in _top_rs:
+                                st.markdown(
+                                    f'<div style="background:#fef9e7;border-left:4px solid #e74c3c;'
+                                    f'border-radius:6px;padding:7px 12px;margin:4px 0;'
+                                    f'font-size:13px;">'
+                                    f'⚠️ {rs} <span style="color:#888;font-size:11px;">({cnt}건)</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.info("위험 신호 데이터 없음")
+                    with col_fkw:
+                        st.markdown(f"**💭 고객 주요 키워드** (부정 감정 평균: {_avg_neg}%)")
+                        if _top_fail_ckw:
+                            _fkw_html = " ".join(
+                                f'<span style="background:#fce8e8;border:1px solid #e74c3c;'
+                                f'border-radius:14px;padding:4px 10px;margin:3px;'
+                                f'display:inline-block;font-size:13px;color:#922b21;">'
+                                f'{kw} ({cnt})</span>'
+                                for kw, cnt in _top_fail_ckw
                             )
+                            st.markdown(_fkw_html, unsafe_allow_html=True)
+
+            # ── 탭 3: 득점 격차 분석 ─────────────────────────────────────
+            with ins_tab3:
+                if len(records_filtered) < 3:
+                    st.info("득점 격차 분석은 3건 이상 분석 후 가능합니다.")
+                else:
+                    # 항목별 점수 집계
+                    _item_scores: dict = {}
+                    for r in records_filtered:
+                        rubric_r = r.get("rubric_used") or []
+                        for k, v in r.get("quality_scores", {}).items():
+                            try:
+                                fv = float(v)
+                            except (TypeError, ValueError):
+                                continue
+                            배점 = next((row["배점"] for row in rubric_r if row["항목"] == k), 5)
+                            환산 = round((fv / 5.0) * 배점, 2)
+                            if k not in _item_scores:
+                                _item_scores[k] = {"scores": [], "max": 배점}
+                            _item_scores[k]["scores"].append(환산)
+
+                    if not _item_scores:
+                        st.info("품질 점수 데이터가 없습니다.")
                     else:
-                        st.info("강점 데이터 부족")
+                        _gap_rows = []
+                        for item, data in _item_scores.items():
+                            sc = data["scores"]
+                            if len(sc) < 2: continue
+                            _max_sc  = max(sc)
+                            _min_sc  = min(sc)
+                            _avg_sc  = round(sum(sc) / len(sc), 2)
+                            _gap     = round(_max_sc - _min_sc, 2)
+                            _gap_rows.append({
+                                "항목": item,
+                                "평균(환산)": _avg_sc,
+                                "최고점": _max_sc,
+                                "최저점": _min_sc,
+                                "격차": _gap,
+                                "배점": data["max"],
+                            })
+
+                        _gap_df = pd.DataFrame(_gap_rows).sort_values("격차", ascending=False)
+
+                        st.caption("격차가 클수록 개인별 편차가 큰 취약 항목")
+
+                        # 상위 3개 취약 항목 카드
+                        _top3_gap = _gap_df.head(3)
+                        _gap_cols = st.columns(len(_top3_gap))
+                        for idx, (_, row) in enumerate(_top3_gap.iterrows()):
+                            with _gap_cols[idx]:
+                                st.markdown(
+                                    f'<div style="background:#fef9e7;border:1px solid #f39c12;'
+                                    f'border-radius:8px;padding:12px;text-align:center;">'
+                                    f'<div style="font-weight:700;font-size:14px;color:#d35400;">'
+                                    f'{row["항목"]}</div>'
+                                    f'<div style="font-size:22px;font-weight:700;margin:6px 0;">'
+                                    f'격차 {row["격차"]}점</div>'
+                                    f'<div style="font-size:12px;color:#555;">'
+                                    f'최고 {row["최고점"]}점 / 최저 {row["최저점"]}점 / '
+                                    f'평균 {row["평균(환산)"]}점</div>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                        st.markdown("**전체 항목별 득점 격차표**")
+                        st.dataframe(
+                            _gap_df[["항목","배점","평균(환산)","최고점","최저점","격차"]]
+                            .reset_index(drop=True),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
 
 # ══════════════════════════════════════════════════════════
@@ -2602,21 +3283,42 @@ with tab_list:
                     st.session_state.reanalyze_target = None
                 do_analyze = st.button(btn_lbl, key=f"ai_{sel_id}", type="primary") or _auto_reanalyze
                 if do_analyze:
-                    try:
-                        # 재분석 시 트랜스크립트 캐시 강제 초기화 → 최신 설정으로 프롬프트 재생성
-                        st.session_state.transcripts.pop(sel_id, None)
-                        with st.spinner("AI 심층 분석 중... (Gemini → ChatGPT 자동 전환)"):
-                            record = run_hybrid_analysis(
-                                client=client, content_id=sel_id,
-                                title=sel_title, start_time=sel_item.get("meetingStartTime"),
-                                title_meta=sel_meta, cfg=cfg,
-                            )
-                        st.session_state.analyzed[sel_id] = record
-                        save_analysis_results(st.session_state.analyzed)  # 즉시 파일 저장
-                        st.success(f"분석 완료! 총점: **{record['total_score']}점** [{record.get('engine','')}]")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"분석 실패: {e}")
+                    # ── 사전 검사: 클라이언트 및 AI 키 확인 ──
+                    if not client:
+                        st.error("팀블로 API에 연결되어 있지 않습니다. 사이드바에서 재연결하세요.")
+                    elif not is_gemini_ready(cfg) and not is_openai_ready(cfg):
+                        st.error(
+                            "AI 분석 키가 설정되지 않았습니다.  \n"
+                            ".env 파일에 `GEMINI_API_KEY` 또는 `OPENAI_API_KEY`를 입력한 뒤 앱을 재시작하세요."
+                        )
+                    else:
+                        try:
+                            # 재분석 시 트랜스크립트 캐시 강제 초기화 → 최신 설정으로 프롬프트 재생성
+                            st.session_state.transcripts.pop(sel_id, None)
+                            with st.spinner("AI 심층 분석 중..."):
+                                record = run_hybrid_analysis(
+                                    client=client, content_id=sel_id,
+                                    title=sel_title, start_time=sel_item.get("meetingStartTime"),
+                                    title_meta=sel_meta, cfg=cfg,
+                                )
+                            st.session_state.analyzed[sel_id] = record
+                            save_analysis_results(st.session_state.analyzed)  # 즉시 파일 저장
+                            st.success(f"분석 완료! 총점: **{record['total_score']}점** [{record.get('engine','')}]")
+                            st.rerun()
+                        except Exception as e:
+                            etype_btn = classify_error(e)
+                            if etype_btn == "AUTH":
+                                st.error(
+                                    f"인증 오류: API 키가 만료되었거나 유효하지 않습니다.  \n"
+                                    f"`.env` 파일의 키 값을 확인하세요.  \n"
+                                    f"상세: `{str(e)[:200]}`"
+                                )
+                            elif etype_btn == "RATE_LIMIT":
+                                st.warning(f"API 호출 한도 초과입니다. 잠시 후 다시 시도하세요.  \n`{str(e)[:120]}`")
+                            elif etype_btn == "EMPTY_DATA":
+                                st.info(f"이 상담은 분석 가능한 텍스트가 없습니다.  \n`{str(e)[:120]}`")
+                            else:
+                                st.error(f"분석 실패 [{etype_btn}]: {str(e)[:300]}")
 
                 if existing:
                     st.markdown("---")
