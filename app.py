@@ -1532,31 +1532,61 @@ def run_hybrid_analysis(client, content_id, title, start_time, title_meta, cfg) 
 # ══════════════════════════════════════════════════════════
 def make_radar_chart(cats, vals, color="royalblue", height=320,
                      overlay_vals=None, overlay_name="선택 상담자", overlay_color="#e74c3c"):
+    # ── 입력값 정제: None·NaN → 50.0, 범위 클램프 ──────────────────────────
+    def _clean(v_list):
+        out = []
+        for v in v_list:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                fv = 50.0
+            out.append(max(0.0, min(100.0, fv)))
+        return out
+
+    r_vals = _clean(vals)
+    # 폐합: 마지막 점을 첫 번째와 명시적으로 연결
+    r_closed     = r_vals + [r_vals[0]]
+    theta_closed = list(cats) + [cats[0]]
+
     fig = go.Figure()
     fig.add_trace(go.Scatterpolar(
-        r=vals + [vals[0]], theta=cats + [cats[0]],
+        r=r_closed, theta=theta_closed,
         fill="toself", fillcolor="rgba(65,105,225,0.15)",
         line=dict(color=color, width=2), name="전체 평균",
         mode="lines+markers+text",
-        text=[f"{v:.0f}" for v in vals] + [""],
+        text=[f"{v:.0f}" for v in r_vals] + [""],
         textposition="top center",
-        textfont=dict(size=11, color=color),
+        textfont=dict(size=9, color=color),
     ))
     if overlay_vals:
+        o_vals   = _clean(overlay_vals)
+        o_closed = o_vals + [o_vals[0]]
         fig.add_trace(go.Scatterpolar(
-            r=overlay_vals + [overlay_vals[0]], theta=cats + [cats[0]],
+            r=o_closed, theta=theta_closed,
             fill="toself", fillcolor="rgba(231,76,60,0.15)",
             line=dict(color=overlay_color, width=2.5, dash="solid"), name=overlay_name,
             mode="lines+markers+text",
-            text=[f"{v:.0f}" for v in overlay_vals] + [""],
+            text=[f"{v:.0f}" for v in o_vals] + [""],
             textposition="top center",
-            textfont=dict(size=11, color=overlay_color),
+            textfont=dict(size=9, color=overlay_color),
         ))
     fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        polar=dict(
+            radialaxis=dict(
+                visible=True, range=[0, 100],
+                gridcolor="rgba(180,180,180,0.35)",
+                linecolor="rgba(180,180,180,0.35)",
+                tickfont=dict(size=8, color="#888888"),
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=10, color="#444444"),
+                linecolor="rgba(180,180,180,0.4)",
+            ),
+        ),
         showlegend=bool(overlay_vals),
-        legend=dict(orientation="h", y=-0.15),
-        margin=dict(t=30, b=40, l=40, r=40), height=height,
+        legend=dict(orientation="h", y=-0.18, font=dict(size=11)),
+        margin=dict(t=40, b=40, l=60, r=60),
+        height=height,
     )
     return fig
 
@@ -2395,39 +2425,89 @@ with tab_dash:
             with col_radar:
                 _radar_label = f"{f_counselor} vs 전체 평균" if f_counselor != "전체 보기" else "품질 지표 레이더"
                 st.markdown(f"**{_radar_label}**")
+
+                # ── 5개 그룹 정의 (항목 순서 기준 슬라이싱) ──────────────────
+                _RADAR_GROUPS = [
+                    ("라포·도입",     slice(0,  4)),   # 항목 1~4
+                    ("니즈 파악",     slice(4,  9)),   # 항목 5~9
+                    ("직업·시장",     slice(9,  14)),  # 항목 10~14
+                    ("서비스·시스템", slice(14, 22)),  # 항목 15~22
+                    ("수익·클로징",   slice(22, 30)),  # 항목 23~30
+                ]
+
+                def _norm_cat(s: str) -> str:
+                    """항목 키 정규화: 공백·탭 제거 후 소문자 변환."""
+                    return re.sub(r"[\s\u00a0\u3000]+", "", str(s)).strip()
+
+                def _build_qs_avg(recs: list, cat_list: list, fallback: float = 50.0) -> dict:
+                    """레코드 목록에서 항목별 0~100 스케일 평균 반환.
+                    - quality_scores 키를 정규화하여 공백 오탐 방지
+                    - 데이터 없는 항목은 fallback 으로 보정
+                    """
+                    agg: dict = {k: [] for k in cat_list}
+                    for r in recs:
+                        qs_raw = r.get("quality_scores", {})
+                        # 키 정규화 매핑: 정규화된 키 → 원본 값
+                        qs_norm = {_norm_cat(k): v for k, v in qs_raw.items()}
+                        for k in cat_list:
+                            v = qs_norm.get(_norm_cat(k))
+                            if v is not None:
+                                try:
+                                    agg[k].append(float(v))
+                                except (TypeError, ValueError):
+                                    pass
+                    result = {}
+                    for k, scores in agg.items():
+                        if scores:
+                            result[k] = round(sum(scores) / len(scores) / 5 * 100, 1)
+                        else:
+                            result[k] = fallback
+                    return result
+
+                def _group_avg(qs_dict: dict, ordered_cats: list, fallback: float = 50.0) -> list:
+                    """ordered_cats 기준 슬라이싱 → 그룹별 평균(0~100).
+                    그룹에 매핑된 항목이 하나도 없으면 fallback(전체 평균) 사용 → 도형 왜곡 방지."""
+                    avgs = []
+                    for _, sl in _RADAR_GROUPS:
+                        grp_keys = ordered_cats[sl]
+                        scores = [qs_dict[k] for k in grp_keys if k in qs_dict and qs_dict[k] != fallback]
+                        avgs.append(round(sum(scores) / len(scores), 1) if scores else fallback)
+                    return avgs
+
+                # ── 전체 항목 목록 수집 (키 strip 처리) ─────────────────────
                 seen_cats: dict = {}
                 for r in records_filtered:
                     rubric_r = r.get("rubric_used") or []
                     if rubric_r:
                         for row in rubric_r:
-                            seen_cats.setdefault(row["항목"], None)
+                            seen_cats.setdefault(row["항목"].strip(), None)
                     else:
                         for k in r.get("quality_scores", {}):
-                            seen_cats.setdefault(k, None)
-                cats = list(seen_cats.keys()) or list(QUALITY_WEIGHTS.keys())
-                qs_agg = {k: [] for k in cats}
-                for r in records_filtered:
-                    qs = r.get("quality_scores", {})
-                    for k in cats:
-                        if k in qs: qs_agg[k].append(qs[k])
-                qs_avg = {k: round(sum(v)/len(v)/5*100, 1) if v else 0 for k, v in qs_agg.items()}
-                vals = [qs_avg.get(c, 0) for c in cats]
+                            seen_cats.setdefault(k.strip(), None)
+                all_cats = list(seen_cats.keys()) or list(QUALITY_WEIGHTS.keys())
+
+                # 전체 평균 (빈 그룹 fallback용 전체 평균값 계산)
+                qs_avg      = _build_qs_avg(records_filtered, all_cats, fallback=50.0)
+                _global_avg = round(sum(qs_avg.values()) / max(len(qs_avg), 1), 1)
+
+                group_cats = [g[0] for g in _RADAR_GROUPS]
+                vals = _group_avg(qs_avg, all_cats, fallback=_global_avg)
+
+                # ── 선택 상담자 오버레이 ──────────────────────────────────────
                 _overlay_vals = None
                 if f_counselor != "전체 보기":
                     _counsel_recs = [r for r in records_filtered
                                      if parse_title(r.get("title","")).get("staff","") == f_counselor]
                     if _counsel_recs:
-                        _c_agg = {k: [] for k in cats}
-                        for r in _counsel_recs:
-                            qs = r.get("quality_scores", {})
-                            for k in cats:
-                                if k in qs: _c_agg[k].append(qs[k])
-                        _overlay_vals = [
-                            round(sum(v)/len(v)/5*100, 1) if v else 0
-                            for v in [_c_agg[k] for k in cats]
-                        ]
+                        _c_avg        = _build_qs_avg(_counsel_recs, all_cats, fallback=_global_avg)
+                        _overlay_vals = _group_avg(_c_avg, all_cats, fallback=_global_avg)
+
                 st.plotly_chart(
-                    make_radar_chart(cats, vals, overlay_vals=_overlay_vals, overlay_name=f_counselor),
+                    make_radar_chart(
+                        group_cats, vals,
+                        overlay_vals=_overlay_vals, overlay_name=f_counselor,
+                        height=340,
+                    ),
                     use_container_width=True,
                 )
 
